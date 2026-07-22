@@ -2,6 +2,7 @@
   <img src="https://raw.githubusercontent.com/kalil0321/ats-scrapers/main/assets/banner.jpeg" alt="ats-scrapers" />
 </p>
 
+
 # ats-scrapers
 
 An open dataset and Python toolkit for job data from ATS platforms and public
