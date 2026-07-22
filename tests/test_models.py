@@ -10,14 +10,14 @@ from datetime import datetime
 import pytest
 from pydantic import ValidationError
 
-from jobhive.models import ATSType, Company, Job, Salary
+from ats_scrapers.models import ATSType, Company, Job, Salary
 
 # --- ATSType -----------------------------------------------------------------
 
 def test_ats_type_includes_every_supported_platform() -> None:
     expected = {
         # Multi-tenant ATS systems
-        "ashby", "avature", "cornerstone", "eightfold", "gem", "greenhouse",
+        "ashby", "avature", "beisen", "cornerstone", "eightfold", "gem", "greenhouse",
         "icims", "join_com", "lever", "mercor", "oracle", "personio", "phenom",
         "pinpoint", "recruiterbox", "rippling", "smartrecruiters",
         "successfactors", "workable", "workday",
@@ -84,20 +84,20 @@ def test_salary_is_frozen() -> None:
 # --- Company -----------------------------------------------------------------
 
 def test_company_minimal() -> None:
-    c = Company(slug="openai", name="OpenAI", ats=ATSType.GREENHOUSE)
-    assert c.slug == "openai"
+    c = Company(slug="acme", name="Acme", ats=ATSType.GREENHOUSE)
+    assert c.slug == "acme"
     assert c.careers_url is None
 
 
 def test_company_with_urls() -> None:
     c = Company(
-        slug="openai",
-        name="OpenAI",
+        slug="acme",
+        name="Acme",
         ats=ATSType.GREENHOUSE,
-        careers_url="https://openai.com/careers",
-        website="https://openai.com",
+        careers_url="https://acme.example/careers",
+        website="https://acme.example",
     )
-    assert str(c.careers_url).startswith("https://openai.com/careers")
+    assert str(c.careers_url).startswith("https://acme.example/careers")
 
 
 def test_company_rejects_invalid_url() -> None:
@@ -239,7 +239,7 @@ def test_global_id_keeps_special_chars() -> None:
 
 def test_global_id_uuid_when_ats_id_none(caplog) -> None:
     import logging
-    with caplog.at_level(logging.ERROR, logger="jobhive.models"):
+    with caplog.at_level(logging.ERROR, logger="ats_scrapers.models"):
         job = _minimal_job(ats_type=ATSType.LEVER, ats_id=None)
     assert ":" not in job.global_id  # not the formatted shape
     # Standard UUID4 string length is 36 chars (8-4-4-4-12 hex + dashes)
@@ -279,7 +279,7 @@ def test_global_id_uuid_when_ats_id_has_control_chars(
     when present. Trailing whitespace (including \\r\\n) is stripped
     earlier and not counted as malformed."""
     import logging
-    with caplog.at_level(logging.ERROR, logger="jobhive.models"):
+    with caplog.at_level(logging.ERROR, logger="ats_scrapers.models"):
         job = _minimal_job(ats_type=ATSType.LEVER, ats_id=bad)
     assert ":" not in job.global_id
     assert len(job.global_id) == 36

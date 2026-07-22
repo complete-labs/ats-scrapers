@@ -194,7 +194,8 @@ def jobs_dataframe() -> pd.DataFrame:
                 "title": "Senior ML Engineer",
                 "company": "OpenAI",
                 "location": "San Francisco, CA",
-                "ats_type": "greenhouse",
+                "is_remote": False,
+                "ats_type": "ashby",
                 "ats_id": "1",
                 "salary_min": 200_000,
                 "salary_max": 300_000,
@@ -205,6 +206,7 @@ def jobs_dataframe() -> pd.DataFrame:
                 "title": "Junior Backend Engineer",
                 "company": "Stripe",
                 "location": "Remote",
+                "is_remote": True,
                 "ats_type": "ashby",
                 "ats_id": "2",
                 "salary_min": 100_000,
@@ -216,6 +218,7 @@ def jobs_dataframe() -> pd.DataFrame:
                 "title": "Staff ML Researcher",
                 "company": "Anthropic",
                 "location": "Paris, France",
+                "is_remote": False,
                 "ats_type": "greenhouse",
                 "ats_id": "3",
                 "salary_min": 250_000,
@@ -227,6 +230,7 @@ def jobs_dataframe() -> pd.DataFrame:
                 "title": "Sales Engineer",
                 "company": "Notion",
                 "location": "Remote",
+                "is_remote": True,
                 "ats_type": "lever",
                 "ats_id": "4",
                 "salary_min": None,
@@ -241,7 +245,7 @@ def jobs_dataframe() -> pd.DataFrame:
 def _isolate_default_client_cache() -> Iterator[None]:
     """Reset the lru_cache on `_default_client` between tests so monkeypatched
     clients don't bleed across test modules."""
-    from jobhive import client as client_module
+    from ats_scrapers import client as client_module
 
     client_module._default_client.cache_clear()
     yield

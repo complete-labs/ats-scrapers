@@ -12,10 +12,10 @@ from typing import Any
 import pandas as pd
 import pytest
 
-from jobhive import client as client_module
-from jobhive.client import Client, list_ats, search
-from jobhive.exceptions import ManifestError, StorageError
-from jobhive.models import ATSType
+from ats_scrapers import client as client_module
+from ats_scrapers.client import Client, list_ats, search
+from ats_scrapers.exceptions import ManifestError, StorageError
+from ats_scrapers.models import ATSType
 
 
 @pytest.fixture
@@ -29,7 +29,7 @@ def stub_client(
     Calls to `_download` return our fixture DataFrame; manifest is preloaded
     so no HTTP happens.
     """
-    from jobhive.manifest import Manifest
+    from ats_scrapers.manifest import Manifest
 
     instance = Client(prefer_parquet=False)
     instance._manifest = Manifest.model_validate(sample_manifest_dict)
@@ -67,6 +67,20 @@ def test_search_by_company_substring(stub_client: Client) -> None:
 
 
 def test_search_remote_only(stub_client: Client) -> None:
+    df = stub_client.search(remote=True)
+    assert set(df["company"]) == {"Stripe", "Notion"}
+
+
+def test_search_non_remote_only(stub_client: Client) -> None:
+    df = stub_client.search(remote=False)
+    assert set(df["company"]) == {"OpenAI", "Anthropic"}
+
+
+def test_search_remote_falls_back_to_location_when_flag_is_absent(
+    stub_client: Client,
+) -> None:
+    original_download = stub_client._download
+    stub_client._download = lambda url: original_download(url).drop(columns="is_remote")  # type: ignore[method-assign]
     df = stub_client.search(remote=True)
     assert set(df["company"]) == {"Stripe", "Notion"}
 
@@ -114,7 +128,7 @@ def test_load_caches_full_snapshot(
     sample_manifest_dict: dict[str, Any],
     jobs_dataframe: pd.DataFrame,
 ) -> None:
-    from jobhive.manifest import Manifest
+    from ats_scrapers.manifest import Manifest
 
     instance = Client()
     instance._manifest = Manifest.model_validate(sample_manifest_dict)
@@ -152,6 +166,20 @@ def test_load_accepts_ats_as_string_or_enum(stub_client: Client) -> None:
     pd.testing.assert_frame_equal(df1, df2)
 
 
+def test_load_accepts_manifest_source_not_in_local_enum(
+    stub_client: Client,
+) -> None:
+    stub_client._manifest = stub_client.manifest.model_copy(
+        update={
+            "by_ats": {
+                **stub_client.manifest.by_ats,
+                "beisen": stub_client.manifest.by_ats["greenhouse"],
+            }
+        }
+    )
+    assert len(stub_client.load(ats="beisen")) == 4
+
+
 def test_client_defaults_to_csv_without_parquet_engine(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -164,7 +192,7 @@ def test_load_date_reuses_manifest_url_picker(
     sample_manifest_dict: dict[str, Any],
     jobs_dataframe: pd.DataFrame,
 ) -> None:
-    from jobhive.manifest import Manifest
+    from ats_scrapers.manifest import Manifest
 
     sample_manifest_dict["by_date"]["2026-05-04"] = {
         "parquet": "https://example.com/2026-05-04.parquet",
@@ -221,7 +249,7 @@ def test_download_parquet_without_engine_raises_storage_error(
 
     monkeypatch.setattr(pd, "read_parquet", fail_read_parquet)
     instance = Client()
-    with pytest.raises(StorageError, match="jobhive-py\\[parquet\\]"):
+    with pytest.raises(StorageError, match="ats-scrapers\\[parquet\\]"):
         instance._download("https://example.com/data.parquet")
 
 
@@ -239,7 +267,7 @@ def test_module_search_uses_default_client(
     sample_manifest_dict: dict[str, Any],
     jobs_dataframe: pd.DataFrame,
 ) -> None:
-    from jobhive.manifest import Manifest
+    from ats_scrapers.manifest import Manifest
 
     fake = Client()
     fake._manifest = Manifest.model_validate(sample_manifest_dict)
@@ -253,13 +281,13 @@ def test_module_search_uses_default_client(
 def test_list_ats_returns_manifest_keys(
     monkeypatch: pytest.MonkeyPatch, sample_manifest_dict: dict[str, Any]
 ) -> None:
-    from jobhive.manifest import Manifest
+    from ats_scrapers.manifest import Manifest
 
     fake = Client()
     fake._manifest = Manifest.model_validate(sample_manifest_dict)
     monkeypatch.setattr(client_module, "_default_client", lambda: fake)
 
-    assert ATSType.GREENHOUSE in list_ats()
+    assert "greenhouse" in list_ats()
 
 
 # --- context manager ---------------------------------------------------------

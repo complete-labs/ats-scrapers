@@ -8,16 +8,16 @@ from typing import Any
 import httpx
 import pytest
 
-from jobhive.exceptions import ManifestError
-from jobhive.manifest import Manifest, _pick_url
-from jobhive.models import ATSType
+from ats_scrapers.exceptions import ManifestError
+from ats_scrapers.manifest import Manifest, _pick_url
+from ats_scrapers.models import ATSType
 
 
 def test_manifest_parses_full_payload(sample_manifest_dict: dict[str, Any]) -> None:
     m = Manifest.model_validate(sample_manifest_dict)
     assert m.stats.total_jobs == 1000
-    assert ATSType.GREENHOUSE in m.by_ats
-    assert m.by_ats[ATSType.LEVER].parquet is None
+    assert "greenhouse" in m.by_ats
+    assert m.by_ats["lever"].parquet is None
     assert "2026-05-03" in m.by_date
 
 
@@ -49,6 +49,18 @@ def test_url_for_unknown_ats_raises(sample_manifest_dict: dict[str, Any]) -> Non
         m.url_for_ats(ATSType.WORKDAY)
 
 
+def test_manifest_accepts_source_without_local_scraper_enum(
+    sample_manifest_dict: dict[str, Any],
+) -> None:
+    sample_manifest_dict["by_ats"]["beisen"] = {
+        "csv": "https://example.com/beisen.csv",
+        "rows": 10,
+        "size_bytes": 100,
+    }
+    m = Manifest.model_validate(sample_manifest_dict)
+    assert m.url_for_ats("beisen") == "https://example.com/beisen.csv"
+
+
 def test_url_for_all_returns_parquet_by_default(sample_manifest_dict: dict[str, Any]) -> None:
     m = Manifest.model_validate(sample_manifest_dict)
     assert m.url_for_all() == "https://example.com/all.parquet"
@@ -61,7 +73,7 @@ def test_url_for_all_csv_fallback(sample_manifest_dict: dict[str, Any]) -> None:
 
 
 def test_pick_url_raises_when_neither_url_present() -> None:
-    from jobhive.manifest import FileEntry
+    from ats_scrapers.manifest import FileEntry
 
     bad = FileEntry.model_construct(csv=None, parquet=None, rows=0, size_bytes=0)
     with pytest.raises(ManifestError):
@@ -69,7 +81,7 @@ def test_pick_url_raises_when_neither_url_present() -> None:
 
 
 def test_pick_url_falls_back_to_parquet_when_csv_missing() -> None:
-    from jobhive.manifest import FileEntry
+    from ats_scrapers.manifest import FileEntry
 
     entry = FileEntry(csv=None, parquet="https://x/y.parquet", rows=1, size_bytes=1)
     assert _pick_url(entry, prefer_parquet=False) == "https://x/y.parquet"
