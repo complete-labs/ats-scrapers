@@ -5,6 +5,8 @@ All notable changes to **ats-scrapers** are documented here. The project follows
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-07-23
+
 ### Added — company discovery without ATS knowledge
 
 Nobody knows OpenAI runs on Ashby. Two new package-root entry points
@@ -25,6 +27,20 @@ Skip dataset sources this package can't scrape yet without catching
 `ScraperError` (GH-185). The hosted dataset can list a source before a
 matching scraper ships — `search()` already tolerates that; this makes
 the scraper side symmetric.
+
+### Fixed
+
+- Search filters now treat user input as literal text instead of a regular
+  expression, so values containing characters such as `+`, `(`, or `[` work
+  correctly and cannot trigger regex errors (GH-182).
+- Unknown hosted dataset sources remain usable even when the installed
+  package does not yet define a matching enum member or scraper (GH-185).
+
+### Security
+
+- Multi-tenant scraper constructors now validate slugs before interpolating
+  them into hostnames or URL paths, preventing malformed tenant input from
+  escaping the intended ATS origin.
 
 ## [0.1.0] — 2026-07-22
 

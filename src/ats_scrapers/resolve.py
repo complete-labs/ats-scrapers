@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import re
 from typing import TYPE_CHECKING, NamedTuple
-from urllib.parse import urlparse
+from urllib.parse import ParseResult, urlparse
 
 from ats_scrapers.exceptions import ScraperError
 from ats_scrapers.models import ATSType
@@ -47,7 +47,7 @@ class ResolvedCareersUrl(NamedTuple):
     slug: str
 
 
-def _first_path_segment(parsed) -> str | None:
+def _first_path_segment(parsed: ParseResult) -> str | None:
     segments = [s for s in parsed.path.split("/") if s]
     return segments[0] if segments else None
 
