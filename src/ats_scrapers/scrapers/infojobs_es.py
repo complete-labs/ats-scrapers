@@ -52,6 +52,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from ats_scrapers.exceptions import ScraperError
+from ats_scrapers.fetch import proxy_url_from_env
 from ats_scrapers.models import ATSType, Job
 from ats_scrapers.scrapers.base import BaseScraper, ScraperRegistry
 
@@ -63,6 +64,10 @@ if TYPE_CHECKING:
 API_ROOT = "https://www.infojobs.net"
 LISTING_URL = f"{API_ROOT}/ofertas-trabajo"
 DEFAULT_MAX_PAGES = 3500  # ~66k offers / 22 per page = ~3000 pages
+# Retry knobs for the httpcloak transport. This scraper deliberately
+# does NOT use the shared Fetcher's cloak engine: InfoJobs treats 403
+# as *transient* (Distil challenges deep pagination and backs off),
+# which the Fetcher never retries in cloak mode.
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 1.5
 
@@ -128,17 +133,21 @@ class InfoJobsSpainScraper(BaseScraper):
         company_slug: str,
         *,
         timeout: float = 30.0,
+        include_descriptions: bool = True,
+        proxy: str | None = None,
         max_pages: int = DEFAULT_MAX_PAGES,
         listing_url: str = LISTING_URL,
     ) -> None:
-        super().__init__(company_slug, timeout=timeout)
+        super().__init__(
+            company_slug,
+            timeout=timeout,
+            include_descriptions=include_descriptions,
+            proxy=proxy,
+        )
         self.max_pages = max(1, max_pages)
         self.listing_url = listing_url
 
-    def fetch(self) -> list[Job]:
-        return asyncio.run(self._fetch_async())
-
-    async def _fetch_async(self) -> list[Job]:
+    async def afetch(self) -> list[Job]:
         # httpcloak is the only viable transport — bare httpx is gated
         # by Distil + Geetest. Surface a clear install hint when the
         # optional extra is missing rather than crashing mid-fetch.
@@ -212,8 +221,12 @@ class InfoJobsSpainScraper(BaseScraper):
         even httpcloak gets challenged on deep pagination) is treated
         as transient up to ``MAX_RETRIES``."""
         last_status: int | None = None
+        # Explicit ctor proxy wins over the env-derived one.
+        proxy = self.proxy or proxy_url_from_env()
         for attempt in range(1, MAX_RETRIES + 1):
-            result = await asyncio.to_thread(_httpcloak_get_sync, url, self.timeout)
+            result = await asyncio.to_thread(
+                _httpcloak_get_sync, url, self.timeout, proxy
+            )
             if isinstance(result, str):
                 return result
             last_status = result
@@ -303,13 +316,18 @@ class InfoJobsSpainScraper(BaseScraper):
 # --- module-level helpers ---------------------------------------------------
 
 
-def _httpcloak_get_sync(url: str, timeout: float) -> str | int:
+def _httpcloak_get_sync(
+    url: str, timeout: float, proxy: str | None = None
+) -> str | int:
     """Sync ``httpcloak.get`` — returns the page text on 200, the
     bare status int otherwise so the async caller can retry vs.
     escalate. ``timeout`` is forwarded verbatim."""
     import httpcloak
 
-    r = httpcloak.get(url, timeout=timeout)
+    kwargs: dict[str, str] = {}
+    if proxy:
+        kwargs["proxy"] = proxy
+    r = httpcloak.get(url, timeout=timeout, **kwargs)
     if r.status_code != 200:
         return int(r.status_code)
     content = r.content
