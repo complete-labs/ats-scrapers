@@ -6,7 +6,7 @@ dataset gets a new column, every scraper must populate it (or leave
 it None), and the parquet schema gets a new field.
 
 The Job schema is also documented for human readers in
-``JOB_SCHEMA.md`` at the repo root — keep the two in sync. ``Field``
+``docs/JOB_SCHEMA.md`` — keep the two in sync. ``Field``
 descriptions in this file are the source of truth; the markdown is a
 view onto them.
 """

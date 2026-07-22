@@ -65,7 +65,7 @@ jobs = search(query="data engineer", remote=True, salary_min=80_000)
 
 The [live manifest](https://storage.stapply.ai/jobhive/v1/manifest.json)
 contains current row counts and artifact URLs. See the
-[job schema](https://github.com/kalil0321/ats-scrapers/blob/main/JOB_SCHEMA.md)
+[job schema](https://github.com/kalil0321/ats-scrapers/blob/main/docs/JOB_SCHEMA.md)
 for field definitions and normalization rules.
 
 ## Scrape a company

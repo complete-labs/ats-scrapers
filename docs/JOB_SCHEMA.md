@@ -6,7 +6,7 @@ Field names are part of the public contract — renames are a breaking
 change.
 
 This doc mirrors the [`Job` Pydantic model in
-`src/ats_scrapers/models.py`](src/ats_scrapers/models.py). When the two drift,
+`src/ats_scrapers/models.py`](../src/ats_scrapers/models.py). When the two drift,
 the Pydantic descriptions are the source of truth; please update both.
 
 ---
