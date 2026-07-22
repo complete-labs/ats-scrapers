@@ -16,6 +16,7 @@ from functools import lru_cache
 from importlib.util import find_spec
 from io import BytesIO
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 import httpx
 import pandas as pd
@@ -85,15 +86,15 @@ class Client:
 
         if ats is not None:
             url = self.manifest.url_for_ats(ats, prefer_parquet=self._prefer_parquet)
-            return self._download(url)
+            return _normalize_dataset(self._download(url))
 
         if date is not None:
             url = self.manifest.url_for_date(date, prefer_parquet=self._prefer_parquet)
-            return self._download(url)
+            return _normalize_dataset(self._download(url))
 
         if self._snapshot is None:
             url = self.manifest.url_for_all(prefer_parquet=self._prefer_parquet)
-            self._snapshot = self._download(url)
+            self._snapshot = _normalize_dataset(self._download(url))
         return self._snapshot
 
     def search(
@@ -179,6 +180,39 @@ def _default_client() -> Client:
 
 def _has_parquet_engine() -> bool:
     return find_spec("pyarrow") is not None or find_spec("fastparquet") is not None
+
+
+def _normalize_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    """Bring older hosted slices up to the current client schema.
+
+    Dataset schema v2 predates ``Job.global_id``. Derive it with the current
+    model's composite format so callers get a stable public column while old
+    hosted artifacts are phased out. Invalid identifiers receive the model's
+    UUID fallback instead of producing malformed composite IDs.
+    """
+    if "global_id" in df.columns or not {"ats_type", "ats_id"}.issubset(df.columns):
+        return df
+
+    ats_types = df["ats_type"].astype("string").str.strip()
+    ats_ids = df["ats_id"].astype("string").str.strip()
+    valid = (
+        ats_types.notna()
+        & ats_types.ne("")
+        & ats_ids.notna()
+        & ats_ids.ne("")
+        & ~ats_ids.str.contains(r"[\x00-\x1f\x7f]", regex=True, na=False)
+    )
+
+    global_ids = pd.Series(index=df.index, dtype="string")
+    global_ids.loc[valid] = ats_types.loc[valid].str.cat(ats_ids.loc[valid], sep=":")
+    invalid_count = int((~valid).sum())
+    if invalid_count:
+        global_ids.loc[~valid] = [str(uuid4()) for _ in range(invalid_count)]
+
+    # ``df`` is freshly created by the download parser. Insert in place to
+    # avoid doubling memory use for the multi-gigabyte full snapshot.
+    df.insert(0, "global_id", global_ids)
+    return df
 
 
 def search(

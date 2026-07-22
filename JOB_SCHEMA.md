@@ -72,14 +72,11 @@ or non-ASCII characters.
 
 ### `company` &nbsp;`str` &nbsp;*(required)*
 
-Display name of the hiring employer. **Distinct from `ats_id`:** the
-same company can have `company="OpenAI"` and `ats_id="openai"` on Ashby.
-
-Per-ATS conventions vary — Greenhouse stores a numeric board id,
-Workday the human-readable name, Oracle the API host, etc. — so don't
-join on `company` cross-ATS. Use `ats_type` + `ats_id` for cross-ATS
-keys and `requisition_id` (when both rows have it) for cross-ATS
-matching.
+Display name of the hiring employer. **Distinct from `ats_id`,** which
+identifies the posting within its source (for example, an Ashby UUID or
+Greenhouse numeric job id). Do not use `company` as a posting identifier;
+use `global_id` instead. For cross-ATS matching, combine normalized company
+data with `requisition_id` when both rows provide it.
 
 ### `ats_type` &nbsp;`ATSType` &nbsp;*(required)*
 

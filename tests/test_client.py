@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from io import BytesIO
 from typing import Any
+from uuid import UUID
 
 import pandas as pd
 import pytest
@@ -164,6 +165,37 @@ def test_load_accepts_ats_as_string_or_enum(stub_client: Client) -> None:
     df1 = stub_client.load(ats="greenhouse")
     df2 = stub_client.load(ats=ATSType.GREENHOUSE)
     pd.testing.assert_frame_equal(df1, df2)
+
+
+def test_load_backfills_global_id_for_legacy_dataset(stub_client: Client) -> None:
+    df = stub_client.load(ats="greenhouse")
+    assert df.columns[0] == "global_id"
+    assert list(df["global_id"]) == [
+        "ashby:1",
+        "ashby:2",
+        "greenhouse:3",
+        "lever:4",
+    ]
+
+
+def test_load_preserves_published_global_id(stub_client: Client) -> None:
+    original_download = stub_client._download
+    stub_client._download = lambda url: original_download(url).assign(global_id="existing")  # type: ignore[method-assign]
+    df = stub_client.load(ats="greenhouse")
+    assert set(df["global_id"]) == {"existing"}
+
+
+def test_load_uses_uuid_for_invalid_legacy_ats_id(stub_client: Client) -> None:
+    original_download = stub_client._download
+
+    def download_with_invalid_id(url: str) -> pd.DataFrame:
+        df = original_download(url)
+        df.loc[0, "ats_id"] = "broken\nid"
+        return df
+
+    stub_client._download = download_with_invalid_id  # type: ignore[method-assign]
+    value = stub_client.load(ats="greenhouse").iloc[0]["global_id"]
+    assert str(UUID(value)) == value
 
 
 def test_load_accepts_manifest_source_not_in_local_enum(

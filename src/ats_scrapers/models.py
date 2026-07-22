@@ -225,13 +225,9 @@ class Job(BaseModel):
     company: str = Field(
         ...,
         description=(
-            "Display name of the hiring employer. Distinct from "
-            "``ats_id``: the same company can have ``company='OpenAI'`` "
-            "and ``ats_id='openai'`` on Ashby. Different ATSes use "
-            "different conventions — Greenhouse stores a numeric board "
-            "id, Workday stores the human-readable name, Oracle the "
-            "host, etc. — so don't depend on this field for cross-ATS "
-            "joining; use ``ats_type``+``ats_id`` instead."
+            "Display name of the hiring employer. Distinct from ``ats_id``, "
+            "which identifies the posting within its source (for example, "
+            "an Ashby UUID or Greenhouse numeric job id)."
         ),
     )
     ats_type: ATSType = Field(

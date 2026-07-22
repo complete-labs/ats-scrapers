@@ -8,7 +8,8 @@ All notable changes to **ats-scrapers** are documented here. The project follows
 Initial release of `ats-scrapers`:
 
 - A Python client for querying the hosted job dataset (`search`,
-  `Client`, `list_ats`, `Manifest`).
+  `Client`, `list_ats`, `Manifest`), including a compatibility backfill for
+  `global_id` when reading legacy schema-v2 dataset artifacts.
 - A shared `Job`/`Company` schema and 52 scraper adapters for ATS
   platforms and job sources.
 - Async-first scrapers: every adapter implements `async def afetch()`;
