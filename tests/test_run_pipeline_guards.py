@@ -17,6 +17,15 @@ def test_provider_slug_normalizers_match_current_company_csv_shape() -> None:
     }
     assert runner._successfactors_slug(sf_row) == "https://ace1950.jobs2web.com"
 
+    icims_custom_host_row = {
+        "name": "Accion International",
+        "slug": "jobs-accion",
+        "url": "https://jobs-accion.icims.com",
+    }
+    assert runner._icims_slug(icims_custom_host_row) == (
+        "https://jobs-accion.icims.com"
+    )
+
     oracle_row = {
         "name": "ABM US",
         "slug": "eiqg",
