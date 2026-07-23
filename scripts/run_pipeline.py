@@ -309,18 +309,16 @@ def _oracle_site_from_url(raw: str) -> str | None:
 
 def _icims_slug(row: dict[str, Any]) -> str | None:
     """iCIMS rows can have a bare slug in `name`/`slug` or a
-    `careers-{slug}.icims.com` URL. Either form is accepted by the
-    scraper, but normalize to slug. Keep parsing the URL first when
-    present because some tenants use the `uscareers-` subdomain
-    variant — that information lives in the URL, not the slug column."""
+    `*.icims.com` URL. Either form is accepted by the scraper. Normalize
+    standard `careers-` hosts to a slug, but preserve the full URL for every
+    nonstandard prefix because that host cannot be reconstructed from a slug."""
     url = (row.get("url") or "").strip()
     if url:
-        m = re.search(r"//careers-([a-z0-9-]+)\.icims\.com", url)
+        host = (urlparse(url).hostname or "").lower()
+        m = re.fullmatch(r"careers-([a-z0-9-]+)\.icims\.com", host)
         if m:
             return m.group(1)
-        m = re.search(r"//uscareers-([a-z0-9-]+)\.icims\.com", url)
-        if m:
-            # Pass the full URL so the scraper preserves the uscareers- prefix.
+        if host.endswith(".icims.com"):
             return url.split("?", 1)[0].rstrip("/")
     if (slug := _slug_col(row)):
         return slug
