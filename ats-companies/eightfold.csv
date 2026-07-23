@@ -1,11 +1,17 @@
 name,slug,url,domain
 10x Genomics,10xgenomics,https://10xgenomics.eightfold.ai/careers,
+Albemarle,albemarle,https://albemarle.eightfold.ai/careers,albemarle.com
+Alnylam Pharmaceuticals,alnylam,https://alnylam.eightfold.ai/careers,alnylam.com
 Amdocs,amdocs,https://amdocs.eightfold.ai/careers,
 Applied Materials,appliedmaterials,https://appliedmaterials.eightfold.ai/careers,
 Arcadis,arcadis,https://arcadis.eightfold.ai/careers,
+AstraZeneca,astrazeneca,https://astrazeneca.eightfold.ai/careers,astrazeneca.com
+ATB Financial,atb,https://atb.eightfold.ai/careers,atb.com
 Bayer,bayer,https://bayer.eightfold.ai/careers,
 Bimbo Bakeries USA,grupobimbo,https://grupobimbo.eightfold.ai/careers,
 Boston Scientific,bostonscientific,https://bostonscientific.eightfold.ai/careers,
+Bristol Myers Squibb,bms,https://bms.eightfold.ai/careers,bms.com
+British Council,britishcouncil,https://britishcouncil.eightfold.ai/careers,britishcouncil.org
 CACI,caci,https://caci.eightfold.ai/careers,
 Citi,citi,https://citi.eightfold.ai/careers,
 Coca-Cola Europacific Partners,ccep,https://ccep.eightfold.ai/careers,
@@ -29,13 +35,16 @@ GlobalFoundries,globalfoundries,https://globalfoundries.eightfold.ai/careers,glo
 Haleon,haleon,https://haleon.eightfold.ai/careers,
 Hasbro,hasbro,https://hasbro.eightfold.ai/careers,
 Houston ISD,houstonisd,https://apply.houstonisd.org/careers,houstonisd.org
+HP,hp,https://hp.eightfold.ai/careers,hp.com
 HSBC,hsbc,https://hsbc.eightfold.ai/careers,
+Infineon Technologies,infineon,https://infineon.eightfold.ai/careers,infineon.com
 Insight,insight,https://insight.eightfold.ai/careers,
 John Deere,deere,https://careers.deere.com/careers,johndeere.com
 Johns Hopkins University,jhu,https://jhu.eightfold.ai/careers,jhu.edu
 Kering,kering,https://kering.eightfold.ai/careers,
 Kraft Heinz,kraftheinz,https://kraftheinz.eightfold.ai/careers,
 Lam Research,lamresearch,https://lamresearch.eightfold.ai/careers,
+LG CNS,lgcns,https://lgcns.eightfold.ai/careers,lgcns.com
 Liberty Mutual Insurance,libertymutual,https://libertymutual.eightfold.ai/careers,
 Match Group,gotinder,https://gotinder.eightfold.ai/careers,
 MercadoLibre,mercadolibre,https://mercadolibre.eightfold.ai/careers,
@@ -43,12 +52,15 @@ Micron Technology,micron,https://micron.eightfold.ai/careers,
 Microsoft,microsoft,https://microsoft.eightfold.ai/careers,
 Modern Technology Solutions Inc,mtsi-va,https://mtsi-va.eightfold.ai/careers,
 Morgan Stanley,morganstanley,https://morganstanley.eightfold.ai/careers,
+NetApp,netapp,https://netapp.eightfold.ai/careers,netapp.com
 New York Life,newyorklife,https://newyorklife.eightfold.ai/careers,
+nformal,nformal,https://nformal.eightfold.ai/careers,nformal.com
 Northrop Grumman,ngc,https://ngc.eightfold.ai/careers,
 NTT DATA,nttdata,https://nttdata.eightfold.ai/careers,
 NVIDIA Corporation,nvidia,https://nvidia.eightfold.ai/careers,
 OATRH,puertoricogov,https://puertoricogov.eightfold.ai/careers,
 PayPal,paypal,https://paypal.eightfold.ai/careers,
+Plexus,plexus,https://plexus.eightfold.ai/careers,plexus.com
 PTC,ptc,https://ptc.eightfold.ai/careers,
 Qualcomm,qualcomm,https://qualcomm.eightfold.ai/careers,
 Ralliant,ralliant,https://ralliant.eightfold.ai/careers,
