@@ -59,6 +59,7 @@ from ats_scrapers.scrapers import (
     GupyScraper,
     InfoJobsSpainScraper,
     JazzHRScraper,
+    JobBankCAScraper,
     JobsChScraper,
     JobsCzScraper,
     JoinComScraper,
@@ -76,6 +77,7 @@ from ats_scrapers.scrapers import (
     RecruiterboxScraper,
     RemoteOKScraper,
     RipplingScraper,
+    SeekScraper,
     SmartRecruitersScraper,
     SuccessFactorsScraper,
     TaleoScraper,
@@ -665,6 +667,18 @@ CONFIGS: dict[str, dict[str, Any]] = {
         "scraper": InfoJobsSpainScraper, "singleton": True,
         "output": "infojobs_es/jobs.csv",
     },
+    "jobbankca": {
+        "scraper": JobBankCAScraper, "singleton": True,
+        "output": "jobbankca/jobs.csv",
+        "fail_closed_on_empty": True,
+    },
+    "seek": {
+        "scraper": SeekScraper,
+        "slug": lambda r: _slug_col(r) or None,
+        "csv": "ats-companies/seek.csv",
+        "output": "seek/jobs.csv",
+        "fail_closed_on_any_error": True,
+    },
     "jobs_cz": {
         # jobs.cz - Czech Republic's largest direct-posting board. ~10k live via seeded search.
         "scraper": JobsCzScraper, "singleton": True,
@@ -1225,8 +1239,12 @@ async def run(ats: str, concurrency: int, max_tenants: int | None, timeout: floa
                 kw = kwargs_factory(r) if kwargs_factory else {}
                 targets.append((slug, kw))
 
+    configured_target_count = len(targets)
+    omitted_required_shards = 0
     if max_tenants:
         targets = targets[:max_tenants]
+        if cfg.get("fail_closed_on_any_error"):
+            omitted_required_shards = configured_target_count - len(targets)
 
     print(f"[{ats}] Scraping {len(targets)} tenants (concurrency={concurrency}, timeout={timeout}s)")
     sem = asyncio.Semaphore(concurrency)
@@ -1441,6 +1459,49 @@ async def run(ats: str, concurrency: int, max_tenants: int | None, timeout: floa
                 print(
                     f"[{ats}] ACTION retry: streaming scrape failed after "
                     f"{counts['jobs']:,} jobs and no previous jobs.csv exists."
+                )
+            return 1
+
+        empty_output_failure = (
+            bool(cfg.get("fail_closed_on_empty"))
+            and bool(targets)
+            and counts["jobs"] == 0
+        )
+        if empty_output_failure:
+            tmp_output_path.unlink(missing_ok=True)
+            if output_path.exists():
+                print(
+                    f"[{ats}] ACTION keep_previous: required scrape returned "
+                    f"0 jobs; preserved {output_path} instead of publishing "
+                    "an empty dataset."
+                )
+            else:
+                print(
+                    f"[{ats}] ACTION retry: required scrape returned 0 jobs "
+                    "and no previous jobs.csv exists."
+                )
+            return 1
+
+        sharded_failure = (
+            bool(cfg.get("fail_closed_on_any_error"))
+            and (counts["error"] > 0 or omitted_required_shards > 0)
+        )
+        if sharded_failure:
+            tmp_output_path.unlink(missing_ok=True)
+            required_failures = counts["error"] + omitted_required_shards
+            if output_path.exists():
+                print(
+                    f"[{ats}] ACTION keep_previous: {required_failures}/"
+                    f"{configured_target_count} required shards failed or "
+                    "were omitted after "
+                    f"{counts['jobs']:,} jobs; preserved {output_path} "
+                    "instead of publishing a partial dataset."
+                )
+            else:
+                print(
+                    f"[{ats}] ACTION retry: {required_failures}/"
+                    f"{configured_target_count} required shards failed or "
+                    "were omitted and no previous jobs.csv exists."
                 )
             return 1
 
