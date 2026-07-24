@@ -32,6 +32,7 @@ from ats_scrapers.scrapers.gupy import GupyScraper
 from ats_scrapers.scrapers.icims import iCIMSScraper
 from ats_scrapers.scrapers.infojobs_es import InfoJobsSpainScraper
 from ats_scrapers.scrapers.jazzhr import JazzHRScraper
+from ats_scrapers.scrapers.jobbankca import JobBankCAScraper
 from ats_scrapers.scrapers.jobs_cz import JobsCzScraper
 from ats_scrapers.scrapers.jobsch import JobsChScraper
 from ats_scrapers.scrapers.join_com import JoinComScraper
@@ -49,6 +50,7 @@ from ats_scrapers.scrapers.recruitee import RecruiteeScraper
 from ats_scrapers.scrapers.recruiterbox import RecruiterboxScraper
 from ats_scrapers.scrapers.remoteok import RemoteOKScraper
 from ats_scrapers.scrapers.rippling import RipplingScraper
+from ats_scrapers.scrapers.seek import SeekScraper
 from ats_scrapers.scrapers.smartrecruiters import SmartRecruitersScraper
 from ats_scrapers.scrapers.successfactors import SuccessFactorsScraper
 from ats_scrapers.scrapers.taleo import TaleoScraper
@@ -90,6 +92,7 @@ __all__ = [
     "GupyScraper",
     "InfoJobsSpainScraper",
     "JazzHRScraper",
+    "JobBankCAScraper",
     "JobsChScraper",
     "JobsCzScraper",
     "JoinComScraper",
@@ -108,6 +111,7 @@ __all__ = [
     "RemoteOKScraper",
     "RipplingScraper",
     "ScraperRegistry",
+    "SeekScraper",
     "SmartRecruitersScraper",
     "SuccessFactorsScraper",
     "TaleoScraper",
