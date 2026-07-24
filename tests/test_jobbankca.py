@@ -43,6 +43,7 @@ def _article(
     new_flag: bool = True,
     posted_on_jb: bool = True,
     job_number: str | None = "3571211",
+    posting_path: str = "jobposting",
 ) -> str:
     flags = []
     if new_flag:
@@ -70,7 +71,7 @@ def _article(
         )
     return (
         f'<article id="article-{job_id}" class="action-buttons">'
-        f'<a href="/jobsearch/jobposting/{job_id};jsessionid=ABC?source=searchresults"'
+        f'<a href="/jobsearch/{posting_path}/{job_id};jsessionid=ABC?source=searchresults"'
         ' class="resultJobItem">'
         f'<h3 class="title">{flag_block}'
         '<span class="job-source job-source-icon-16">'
@@ -148,6 +149,16 @@ def test_global_id_uses_jobbankca_prefix() -> None:
     job = JobBankCAScraper("any")._parse_job(_article(job_id="123"))
     assert job is not None
     assert job.global_id == "jobbankca:123"
+
+
+def test_preserves_temporary_foreign_worker_posting_path() -> None:
+    job = JobBankCAScraper("any")._parse_job(
+        _article(job_id="123", posting_path="jobpostingtfw")
+    )
+    assert job is not None
+    assert str(job.url) == (
+        "https://www.jobbank.gc.ca/jobsearch/jobpostingtfw/123"
+    )
 
 
 # --- parse_job: variations --------------------------------------------------

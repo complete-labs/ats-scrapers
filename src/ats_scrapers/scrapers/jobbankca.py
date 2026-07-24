@@ -32,6 +32,7 @@ import logging
 import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
@@ -63,6 +64,11 @@ DEFAULT_TIMEOUT = 60.0
 # round-trip cleanly into the canonical Job schema.
 
 _ARTICLE_OPEN_RE = re.compile(r'<article\s+id="article-(\d+)"', re.IGNORECASE)
+_RESULT_HREF_RE = re.compile(
+    r'<a\b(?=[^>]*\bclass=["\'][^"\']*\bresultJobItem\b[^"\']*["\'])'
+    r'[^>]*\bhref=["\']([^"\']+)["\']',
+    re.IGNORECASE,
+)
 _TITLE_RE = re.compile(
     r'<span\s+class="noctitle"[^>]*>(.*?)</span>', re.IGNORECASE | re.DOTALL
 )
@@ -355,7 +361,7 @@ class JobBankCAScraper(BaseScraper):
         language = self.language if self.language in {"en", "fr"} else "en"
 
         return Job(
-            url=POSTING_URL_TEMPLATE.format(id=ats_id),
+            url=_posting_url(chunk, ats_id),
             title=title,
             company=company,
             ats_type=ATSType.JOBBANKCA,
@@ -374,6 +380,24 @@ class JobBankCAScraper(BaseScraper):
             language=language,
             raw=raw or None,
         )
+
+
+def _posting_url(chunk: str, ats_id: str) -> str:
+    fallback = POSTING_URL_TEMPLATE.format(id=ats_id)
+    match = _RESULT_HREF_RE.search(chunk)
+    if not match:
+        return fallback
+
+    href = html.unescape(match.group(1)).strip()
+    parsed = urlsplit(urljoin("https://www.jobbank.gc.ca", href))
+    path = re.sub(r";jsessionid=[^/?#]+", "", parsed.path, flags=re.IGNORECASE)
+    if (
+        parsed.netloc.lower() != "www.jobbank.gc.ca"
+        or not path.startswith("/jobsearch/jobposting")
+        or not path.endswith(f"/{ats_id}")
+    ):
+        return fallback
+    return f"https://www.jobbank.gc.ca{path}"
 
 
 # --- module-level helpers ----------------------------------------------------
