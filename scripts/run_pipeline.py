@@ -48,6 +48,7 @@ from ats_scrapers.scrapers import (
     BreezyScraper,
     BuiltInScraper,
     BundesagenturScraper,
+    BytedanceScraper,
     CornerstoneScraper,
     DarwinboxScraper,
     EightfoldScraper,
@@ -598,6 +599,11 @@ CONFIGS: dict[str, dict[str, Any]] = {
     "apple": {
         "scraper": AppleScraper, "singleton": True,
         "output": "apple/jobs.csv",
+    },
+    "bytedance": {
+        "scraper": BytedanceScraper, "singleton": True,
+        "output": "bytedance/jobs.csv",
+        "fail_closed_on_empty": True,
     },
     "google": {
         "scraper": GoogleScraper, "singleton": True,
