@@ -698,7 +698,7 @@ def _dedup_from_per_ats_csvs(
     not the corpus) before we run the eager dedup on it. This is the
     key memory win vs an in-memory ``pl.concat([..]).collect()``: the
     per-ATS scans are pulled in one ATS at a time, and the keys
-    parquet on disk is small (~80 MB / million rows for the eight
+    parquet on disk is small (~80 MB / million rows for the nine
     thin string columns we project).
 
     Returns ``(survivors_by_ats, n_raw, n_kept)``.
@@ -731,6 +731,9 @@ def _dedup_from_per_ats_csvs(
                 _key_col_or_empty(schema_names, "location")
                 .str.to_lowercase()
                 .alias("location"),
+                _key_col_or_empty(schema_names, "country_iso")
+                .str.to_uppercase()
+                .alias("country_iso"),
                 _key_col_or_empty(schema_names, "ats_id").alias("ats_id"),
             ]
         )
@@ -849,16 +852,26 @@ def _decide_dedup_survivors_polars(
     # ---- Pass 4 (Phase 1): cross-ATS (company_norm, title_core, country) -
     # ``title_core`` strips the trailing parenthesised Berufenet tag
     # that eures appends but Bundesagentur doesn't. ``country_iso`` is
-    # extracted from free-form ``location`` text (eures encodes it as
-    # the leading ``DE``/``FR``/… token, Bundesagentur as a full
-    # ``", Deutschland"`` suffix). The combination catches the
-    # formatting-only cross-source dups that Pass 2 misses entirely.
+    # prefers the scraper's structured value and falls back to extracting
+    # free-form ``location`` text (eures encodes it as the leading
+    # ``DE``/``FR``/… token, Bundesagentur as a full ``", Deutschland"``
+    # suffix). The combination catches formatting-only cross-source dups
+    # that Pass 2 misses entirely.
+    structured_country = (
+        pl.col("country_iso")
+        if "country_iso" in work.columns
+        else pl.lit("", dtype=pl.String)
+    ).str.strip_chars()
+    derived_country = pl.col("location").map_elements(
+        _country_iso_from_location, return_dtype=pl.String
+    )
     work = work.with_columns(
         pl.col("title_raw")
         .map_elements(_title_core, return_dtype=pl.String)
         .alias("_title_core"),
-        pl.col("location")
-        .map_elements(_country_iso_from_location, return_dtype=pl.String)
+        pl.when(structured_country.str.len_bytes() > 0)
+        .then(structured_country)
+        .otherwise(derived_country)
         .alias("_country_iso"),
     )
     work = work.with_columns(

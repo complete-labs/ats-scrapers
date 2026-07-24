@@ -603,6 +603,44 @@ def test_cross_ats_dedup_keeps_higher_priority_ats(
     assert df["url"].str.contains("workday.com").all()
 
 
+def test_cross_ats_dedup_prefers_structured_country_iso(tmp_path) -> None:
+    import pipeline.publisher as publisher_module
+
+    workday_path = tmp_path / "workday.csv"
+    jobbank_path = tmp_path / "jobbankca.csv"
+    pd.DataFrame([
+        {
+            "url": "https://workday.example/job/1",
+            "title": "Backend Engineer",
+            "company": "Acme",
+            "location": "Toronto, Ontario",
+            "country_iso": "CA",
+            "ats_id": "wd-1",
+        },
+    ]).to_csv(workday_path, index=False)
+    pd.DataFrame([
+        {
+            "url": "https://jobbank.example/job/1",
+            "title": "Backend Engineer",
+            "company": "Acme",
+            "location": "Toronto (ON)",
+            "country_iso": "CA",
+            "ats_id": "jb-1",
+        },
+    ]).to_csv(jobbank_path, index=False)
+
+    survivors, raw_count, kept_count = (
+        publisher_module._dedup_from_per_ats_csvs(
+            {"workday": workday_path, "jobbankca": jobbank_path}
+        )
+    )
+
+    assert raw_count == 2
+    assert kept_count == 1
+    assert survivors["workday"].height == 1
+    assert "jobbankca" not in survivors
+
+
 # --- Phase 1 / Phase 2 cross-source fuzzy dedup -----------------------------
 
 

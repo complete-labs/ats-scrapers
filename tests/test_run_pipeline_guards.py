@@ -910,6 +910,65 @@ def test_required_shard_failure_removes_partial_output(
     assert not (out_dir / ".jobs.csv.tmp").exists()
 
 
+def test_required_shard_limit_preserves_previous_output(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "ats-companies").mkdir()
+    (tmp_path / "ats-companies" / "shards.csv").write_text(
+        (
+            "name,slug,url\n"
+            "One,one,https://one\n"
+            "Two,two,https://two\n"
+            "Three,three,https://three\n"
+        ),
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "sharded"
+    out_dir.mkdir()
+    out_path = out_dir / "jobs.csv"
+    previous = (
+        "url,title,company,ats_type,ats_id\n"
+        "https://example.com/old,Old,Acme,custom,old\n"
+    )
+    out_path.write_text(previous, encoding="utf-8")
+
+    class ShardedScraper:
+        def __init__(self, slug, **_kwargs) -> None:
+            self.slug = slug
+
+        def fetch(self):
+            return [
+                Job(
+                    url=f"https://example.com/{self.slug}",
+                    title="New",
+                    company="Acme",
+                    ats_type=ATSType.CUSTOM,
+                    ats_id=self.slug,
+                )
+            ]
+
+    monkeypatch.setattr(runner, "DATA_ROOT", tmp_path)
+    monkeypatch.setitem(
+        runner.CONFIGS,
+        "sharded",
+        {
+            "scraper": ShardedScraper,
+            "slug": lambda row: row["slug"],
+            "csv": "ats-companies/shards.csv",
+            "output": "sharded/jobs.csv",
+            "fail_closed_on_any_error": True,
+        },
+    )
+
+    rc = asyncio.run(
+        runner.run("sharded", concurrency=1, max_tenants=1, timeout=1)
+    )
+
+    assert rc == 1
+    assert out_path.read_text(encoding="utf-8") == previous
+    assert not (out_dir / ".jobs.csv.tmp").exists()
+
+
 def test_streaming_pipeline_skips_capped_description_cache(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

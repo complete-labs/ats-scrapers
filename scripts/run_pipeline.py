@@ -1239,8 +1239,12 @@ async def run(ats: str, concurrency: int, max_tenants: int | None, timeout: floa
                 kw = kwargs_factory(r) if kwargs_factory else {}
                 targets.append((slug, kw))
 
+    configured_target_count = len(targets)
+    omitted_required_shards = 0
     if max_tenants:
         targets = targets[:max_tenants]
+        if cfg.get("fail_closed_on_any_error"):
+            omitted_required_shards = configured_target_count - len(targets)
 
     print(f"[{ats}] Scraping {len(targets)} tenants (concurrency={concurrency}, timeout={timeout}s)")
     sem = asyncio.Semaphore(concurrency)
@@ -1480,22 +1484,24 @@ async def run(ats: str, concurrency: int, max_tenants: int | None, timeout: floa
 
         sharded_failure = (
             bool(cfg.get("fail_closed_on_any_error"))
-            and counts["error"] > 0
+            and (counts["error"] > 0 or omitted_required_shards > 0)
         )
         if sharded_failure:
             tmp_output_path.unlink(missing_ok=True)
+            required_failures = counts["error"] + omitted_required_shards
             if output_path.exists():
                 print(
-                    f"[{ats}] ACTION keep_previous: {counts['error']}/"
-                    f"{len(targets)} required shards failed after "
+                    f"[{ats}] ACTION keep_previous: {required_failures}/"
+                    f"{configured_target_count} required shards failed or "
+                    "were omitted after "
                     f"{counts['jobs']:,} jobs; preserved {output_path} "
                     "instead of publishing a partial dataset."
                 )
             else:
                 print(
-                    f"[{ats}] ACTION retry: {counts['error']}/"
-                    f"{len(targets)} required shards failed and no previous "
-                    "jobs.csv exists."
+                    f"[{ats}] ACTION retry: {required_failures}/"
+                    f"{configured_target_count} required shards failed or "
+                    "were omitted and no previous jobs.csv exists."
                 )
             return 1
 
