@@ -15,6 +15,7 @@ from ats_scrapers.scrapers import (
     GreenhouseScraper,
     GupyScraper,
     MokaScraper,
+    PageUpScraper,
     UKGProScraper,
     WorkdayScraper,
 )
@@ -32,6 +33,16 @@ RESOLVES = [
     ("https://careers.smartrecruiters.com/10Pearls", ATSType.SMARTRECRUITERS, "10Pearls"),
     ("https://jobs.gem.com/accel", ATSType.GEM, "accel"),
     ("https://ats.rippling.com/acme/jobs", ATSType.RIPPLING, "acme"),
+    (
+        "https://careers.pageuppeople.com/513/cw/en/listing/",
+        ATSType.PAGEUP,
+        "513/cw/en",
+    ),
+    (
+        "https://careers.pageuppeople.com/mob/1078/cw/en/job/123/title",
+        ATSType.PAGEUP,
+        "1078/cw/en",
+    ),
     (
         "https://recruiting2.ultipro.com/HEN1009HPCC/JobBoard/"
         "b27ab828-18a9-4f10-8ee1-8259de6c9e73/OpportunityDetail",
@@ -150,6 +161,12 @@ def test_get_scraper_for_url_builds_scraper() -> None:
         GreenhouseScraper,
     )
     assert isinstance(get_scraper_for_url("https://petz.gupy.io"), GupyScraper)
+    assert isinstance(
+        get_scraper_for_url(
+            "https://careers.pageuppeople.com/513/cw/en/listing/"
+        ),
+        PageUpScraper,
+    )
     assert isinstance(
         get_scraper_for_url(
             "https://recruiting.ultipro.ca/ROY5000RCPS/JobBoard/"
