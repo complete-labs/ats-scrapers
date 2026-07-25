@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 # an f-string URL.
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._\-]*$", re.IGNORECASE)
 _DNS_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", re.IGNORECASE)
+_DAYFORCE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 
 class ResolvedCareersUrl(NamedTuple):
@@ -196,6 +197,39 @@ def resolve_careers_url(url: str) -> ResolvedCareersUrl | None:
                 ATSType.MOKA,
                 f"{prefix}{segments[1]}/{segments[2]}{recruitment_type}",
             )
+        return None
+
+    if host == "jobs.dayforcehcm.com":
+        segments = [segment for segment in parsed.path.split("/") if segment]
+
+        def resolve_segments(parts: list[str]) -> str | None:
+            if (
+                len(parts) < 2
+                or not _DAYFORCE_SEGMENT_RE.fullmatch(parts[0])
+                or not _DAYFORCE_SEGMENT_RE.fullmatch(parts[1])
+            ):
+                return None
+            remainder = [segment.casefold() for segment in parts[2:]]
+            if remainder and not (
+                remainder[0] == "jobs"
+                and len(remainder) in {1, 2, 3}
+                and (len(remainder) == 1 or remainder[1].isdigit())
+                and (len(remainder) < 3 or remainder[2] == "apply")
+            ):
+                return None
+            return f"{parts[0]}/{parts[1]}"
+
+        if (slug := resolve_segments(segments)) is not None:
+            return ResolvedCareersUrl(ATSType.DAYFORCE, slug)
+        if (
+            len(segments) >= 3
+            and re.fullmatch(
+                r"[A-Za-z]{2}(?:-[A-Za-z]{2})?",
+                segments[0],
+            )
+            and (slug := resolve_segments(segments[1:])) is not None
+        ):
+            return ResolvedCareersUrl(ATSType.DAYFORCE, slug)
         return None
 
     for suffix, tld in ((".darwinbox.in", "in"), (".darwinbox.com", "com")):

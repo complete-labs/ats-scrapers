@@ -12,6 +12,7 @@ from ats_scrapers.scrapers import (
     BeisenLegacyScraper,
     BeisenScraper,
     DarwinboxScraper,
+    DayforceScraper,
     GreenhouseScraper,
     GupyScraper,
     JobviteScraper,
@@ -58,6 +59,21 @@ RESOLVES = [
         "b27ab828-18a9-4f10-8ee1-8259de6c9e73",
     ),
     ("https://join.com/companies/acme", ATSType.JOIN_COM, "acme"),
+    (
+        "https://jobs.dayforcehcm.com/en-CA/mayfair/CANDIDATEPORTAL/jobs/3612",
+        ATSType.DAYFORCE,
+        "mayfair/CANDIDATEPORTAL",
+    ),
+    (
+        "https://jobs.dayforcehcm.com/fi/CANDIDATEPORTAL",
+        ATSType.DAYFORCE,
+        "fi/CANDIDATEPORTAL",
+    ),
+    (
+        "https://jobs.dayforcehcm.com/gm/CANDIDATEPORTAL/jobs",
+        ATSType.DAYFORCE,
+        "gm/CANDIDATEPORTAL",
+    ),
     (
         "https://app.mokahr.com/social-recruitment/trip/70415/job/123",
         ATSType.MOKA,
@@ -151,6 +167,8 @@ def test_icims_nonstandard_prefix_keeps_full_url() -> None:
         "https://bad_slug.zhiye.com/social/jobs",
         "https://recruiting.ultipro.com/bad-tenant/JobBoard/"
         "11111111-2222-3333-4444-555555555555",
+        "https://jobs.dayforcehcm.com/en-CA/mayfair/"
+        "CANDIDATEPORTAL/search",
         f"https://{'a' * 64}.zhiye.com/social/jobs",
         "not a url at all",
     ],
@@ -194,6 +212,12 @@ def test_get_scraper_for_url_builds_scraper() -> None:
             "9a9d6241-e23f-47c0-80f3-e43a148972a0"
         ),
         UKGProScraper,
+    )
+    assert isinstance(
+        get_scraper_for_url(
+            "https://jobs.dayforcehcm.com/mayfair/CANDIDATEPORTAL"
+        ),
+        DayforceScraper,
     )
     assert isinstance(
         get_scraper_for_url(
