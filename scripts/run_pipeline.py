@@ -60,6 +60,7 @@ from ats_scrapers.scrapers import (
     GoogleScraper,
     GreenhouseScraper,
     GupyScraper,
+    HerpScraper,
     InfoJobsSpainScraper,
     JazzHRScraper,
     JobBankCAScraper,
@@ -396,6 +397,14 @@ CONFIGS: dict[str, dict[str, Any]] = {
         ),
         "csv": "ats-companies/gem.csv",
         "output": "gem/jobs.csv",
+    },
+    "herp": {
+        "scraper": HerpScraper,
+        "slug": lambda r: _slug_col(r) or (r.get("name") or "").strip() or None,
+        "csv": "ats-companies/herp.csv",
+        "output": "herp/jobs.csv",
+        "max_concurrency": 4,
+        "fail_closed_on_empty": True,
     },
     "successfactors": {
         "scraper": SuccessFactorsScraper,
