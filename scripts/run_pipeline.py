@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import csv
 import fcntl
+import inspect
 import json
 import os
 import re
@@ -30,6 +31,7 @@ import sys
 import tempfile
 import time
 from contextlib import contextmanager
+from functools import cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -863,13 +865,34 @@ def _eightfold_kwargs(row: dict[str, Any]) -> dict[str, Any]:
         kw["company_name"] = name
     return kw
 
+@cache
+def _accepts_company_name(scraper_cls: type) -> bool:
+    """Whether ``scraper_cls`` takes a ``company_name`` keyword.
+
+    Every tenant CSV carries a curated ``name``, so the display name is
+    always available — feed it to any scraper that can use it rather
+    than letting each publish its board slug as the employer. Scrapers
+    that still override ``__init__`` without the keyword are skipped
+    instead of raising, so this stays safe as they're migrated.
+    """
+    try:
+        params = inspect.signature(scraper_cls.__init__).parameters
+    except (TypeError, ValueError):
+        return False
+    return "company_name" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+
 DATA_ROOT = Path(__file__).resolve().parent.parent  # → repo root
 
 JOB_CSV_FIELDS = [
     "url", "title", "company", "ats_type", "ats_id", "location",
     "country_iso", "region", "language", "lat", "lon",
     "is_remote", "salary_min", "salary_max", "salary_currency",
-    "salary_period", "salary_summary", "employment_type",
+    "salary_period", "salary_summary",
+    "offers_equity", "offers_bonus", "offers_commission",
+    "seniority", "experience", "employment_type",
     "department", "team", "description", "posted_at",
     "requisition_id", "apply_url", "commitment", "raw",
 ]
@@ -1255,6 +1278,11 @@ async def _ensure_description(
     return "missing"
 
 
+def _tri_state(value: bool | None) -> str:
+    """Render an optional boolean, keeping "unknown" distinct from "no"."""
+    return "" if value is None else str(value).lower()
+
+
 def _job_to_row(job: Job) -> dict[str, Any]:
     """Flatten a Job to CSV-friendly fields. ``raw`` is JSON-serialized."""
     raw_json = ""
@@ -1275,12 +1303,17 @@ def _job_to_row(job: Job) -> dict[str, Any]:
         "language": job.language or "",
         "lat": "" if job.lat is None else job.lat,
         "lon": "" if job.lon is None else job.lon,
-        "is_remote": "" if job.is_remote is None else str(job.is_remote).lower(),
+        "is_remote": _tri_state(job.is_remote),
         "salary_min": "" if job.salary_min is None else job.salary_min,
         "salary_max": "" if job.salary_max is None else job.salary_max,
         "salary_currency": job.salary_currency or "",
         "salary_period": job.salary_period or "",
         "salary_summary": job.salary_summary or "",
+        "offers_equity": _tri_state(job.offers_equity),
+        "offers_bonus": _tri_state(job.offers_bonus),
+        "offers_commission": _tri_state(job.offers_commission),
+        "seniority": job.seniority or "",
+        "experience": "" if job.experience is None else job.experience,
         "employment_type": job.employment_type or "",
         "department": job.department or "",
         "team": job.team or "",
@@ -1348,10 +1381,15 @@ async def run(ats: str, concurrency: int, max_tenants: int | None, timeout: floa
         with csv_path.open(newline="") as fh:
             rows = list(csv.DictReader(fh))
         kwargs_factory = cfg.get("kwargs")
+        accepts_name = _accepts_company_name(cfg["scraper"])
         for r in rows:
             slug = cfg["slug"](r)
             if slug:
                 kw = kwargs_factory(r) if kwargs_factory else {}
+                if accepts_name and not kw.get("company_name"):
+                    name = (r.get("name") or "").strip()
+                    if name:
+                        kw["company_name"] = name
                 targets.append((slug, kw))
 
     configured_target_count = len(targets)

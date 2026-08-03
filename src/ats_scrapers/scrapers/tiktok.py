@@ -150,6 +150,6 @@ def _parse_ts(value: int | None) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromtimestamp(value)
+        return datetime.fromtimestamp(value, tz=UTC)
     except (ValueError, OSError):
         return None

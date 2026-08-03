@@ -92,12 +92,14 @@ class PinpointScraper(BaseScraper):
         timeout: float = 30.0,
         include_descriptions: bool = True,
         proxy: str | None = None,
+        company_name: str | None = None,
     ) -> None:
         super().__init__(
             company_slug,
             timeout=timeout,
             include_descriptions=include_descriptions,
             proxy=proxy,
+            company_name=company_name,
         )
         self.company_slug = require_host_label(
             company_slug, provider="PinpointScraper"
@@ -171,7 +173,7 @@ class PinpointScraper(BaseScraper):
         return Job(
             url=url,
             title=title,
-            company=self.company_slug,
+            company=self.display_company,
             ats_type=ATSType.PINPOINT,
             ats_id=ats_id,
             location=_format_location(item.get("location")),

@@ -85,12 +85,14 @@ class PersonioScraper(BaseScraper):
         timeout: float = 30.0,
         include_descriptions: bool = True,
         proxy: str | None = None,
+        company_name: str | None = None,
     ) -> None:
         super().__init__(
             company_slug,
             timeout=timeout,
             include_descriptions=include_descriptions,
             proxy=proxy,
+            company_name=company_name,
         )
         slug = company_slug.strip()
         if slug.startswith(("http://", "https://")):
@@ -220,7 +222,11 @@ class PersonioScraper(BaseScraper):
         return Job(
             url=item.get("url") or f"{base}/job/{ats_id}",
             title=item.get("name") or item.get("title") or item.get("subcompany"),
-            company=urlparse(base).hostname or self.company_slug,
+            company=(
+                self.company_name
+                or urlparse(base).hostname
+                or self.company_slug
+            ),
             ats_type=ATSType.PERSONIO,
             ats_id=ats_id,
             location=_extract_location(item),

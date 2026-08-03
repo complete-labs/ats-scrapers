@@ -156,7 +156,7 @@ class LeverScraper(BaseScraper):
         return Job(
             url=item["hostedUrl"],
             title=item["text"],
-            company=self.company_slug,
+            company=self.display_company,
             ats_type=ATSType.LEVER,
             ats_id=item["id"],
             location=categories.get("location"),
@@ -181,6 +181,6 @@ def _parse_ms(value: int | None) -> datetime | None:
     if value is None:
         return None
     try:
-        return datetime.fromtimestamp(value / 1000)
+        return datetime.fromtimestamp(value / 1000, tz=UTC)
     except (ValueError, OSError):
         return None

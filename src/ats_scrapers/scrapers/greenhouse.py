@@ -22,6 +22,7 @@ import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from ats_scrapers.enrichment.derived import parse_salary_block
 from ats_scrapers.models import ATSType, Job
 from ats_scrapers.scrapers.base import BaseScraper, ScraperRegistry
 
@@ -47,6 +48,22 @@ class GreenhouseScraper(BaseScraper):
         async with self.make_fetcher() as fetch:
             payload = await fetch.get_json(url)
         return [self._parse_job(item) for item in payload.get("jobs", [])]
+
+    def _company_for(self, item: dict[str, Any]) -> str:
+        """Employer name, preferring the curated one over the board's.
+
+        Greenhouse puts the employer's own display name on every job
+        (``company_name``), which beats the slug — ``anthropic`` and
+        ``Anthropic`` are otherwise two employers to any consumer that
+        groups on the string. A configured name still wins so the
+        inventory stays the single spelling across every ATS.
+        """
+        if self.company_name:
+            return self.company_name
+        board_name = item.get("company_name")
+        if isinstance(board_name, str) and board_name.strip():
+            return board_name.strip()
+        return self.company_slug
 
     def _parse_job(self, item: dict[str, Any]) -> Job:
         offices = item.get("offices") or []
@@ -93,10 +110,18 @@ class GreenhouseScraper(BaseScraper):
             ):
                 requisition_id = req_str
 
+        # The board API has no pay field — ``pay_input_ranges`` is null
+        # on every job we've seen — but pay-transparency law put the
+        # range in the description body, where Greenhouse renders it in
+        # a fixed shape. Lifting it out is the difference between this
+        # ATS reporting no compensation at all and reporting it on
+        # roughly half its postings.
+        pay = parse_salary_block(description)
+
         return Job(
             url=item["absolute_url"],
             title=item["title"],
-            company=self.company_slug,
+            company=self._company_for(item),
             ats_type=ATSType.GREENHOUSE,
             ats_id=str(item["id"]),
             location=(item.get("location") or {}).get("name"),
@@ -105,6 +130,10 @@ class GreenhouseScraper(BaseScraper):
             requisition_id=requisition_id,
             posted_at=posted_at,
             fetched_at=datetime.now(UTC),
+            salary_min=pay.min_amount if pay else None,
+            salary_max=pay.max_amount if pay else None,
+            salary_currency=pay.currency if pay else None,
+            salary_period=pay.period if pay else None,
             raw=raw or None,
         )
 

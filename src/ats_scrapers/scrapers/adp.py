@@ -23,6 +23,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 from pydantic import HttpUrl
 
+from ats_scrapers.enrichment.uslocation import US_STATE_CODES
 from ats_scrapers.exceptions import ScraperError
 from ats_scrapers.models import ATSType, EmploymentType, Job, SalaryPeriod
 from ats_scrapers.scrapers.base import BaseScraper, ScraperRegistry
@@ -401,6 +402,14 @@ def _locations(item: dict[str, Any]) -> list[str]:
 
 
 def _country_iso(item: dict[str, Any], locations: list[str]) -> str | None:
+    """Country for a requisition, structured field first.
+
+    The text fallback reads the trailing token of ``"City, XX"``, which
+    is a US *state* far more often than a country — ``"Austin, TX"``
+    would otherwise publish country ``TX``, and ``"San Francisco, CA"``
+    country Canada. State codes therefore resolve to ``US``, and only a
+    token that is a country and not a state passes through as-is.
+    """
     raw_locations = item.get("requisitionLocations")
     if isinstance(raw_locations, list):
         for raw in raw_locations:
@@ -415,7 +424,7 @@ def _country_iso(item: dict[str, Any], locations: list[str]) -> str | None:
     for location in locations:
         tail = location.rsplit(",", 1)[-1].strip().upper()
         if len(tail) == 2 and tail.isalpha():
-            return tail
+            return "US" if tail in US_STATE_CODES else tail
     return None
 
 

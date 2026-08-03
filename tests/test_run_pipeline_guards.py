@@ -34,6 +34,88 @@ def test_job_to_row_preserves_structured_location_metadata() -> None:
     assert row["lon"] == 100.5018
 
 
+def test_csv_fieldnames_cover_every_row_key() -> None:
+    """``DictWriter`` raises on an unlisted key, failing the whole run.
+
+    Adding a schema field and forgetting this list turns into a
+    scrape-time crash rather than a missing column.
+    """
+    row = runner._job_to_row(
+        Job(
+            url="https://example.com/jobs/1", title="Engineer",
+            company="Acme", ats_type=ATSType.CUSTOM, ats_id="1",
+        )
+    )
+    assert set(row) <= set(runner.JOB_CSV_FIELDS)
+
+
+def test_every_schema_field_reaches_the_csv() -> None:
+    """A field the scrapers populate but the CSV drops is invisible.
+
+    ``global_id`` is recomputed downstream from ``ats_type``/``ats_id``,
+    so it is the one field deliberately not written.
+    """
+    emitted = set(
+        runner._job_to_row(
+            Job(
+                url="https://example.com/jobs/1", title="Engineer",
+                company="Acme", ats_type=ATSType.CUSTOM, ats_id="1",
+            )
+        )
+    )
+    missing = set(Job.model_fields) - emitted - {"global_id", "fetched_at"}
+    assert missing == set()
+
+
+def test_accepts_company_name_detects_the_keyword() -> None:
+    from ats_scrapers.scrapers import GreenhouseScraper, LeverScraper
+
+    assert runner._accepts_company_name(GreenhouseScraper)
+    assert runner._accepts_company_name(LeverScraper)
+
+
+def test_accepts_company_name_rejects_scrapers_without_it() -> None:
+    """A scraper that predates the keyword must be skipped, not crashed."""
+
+    class Legacy:
+        def __init__(self, company_slug: str, *, timeout: float = 30.0) -> None:
+            self.company_slug = company_slug
+
+    assert not runner._accepts_company_name(Legacy)
+
+
+# Aggregators whose CSV rows are marketplaces or regions rather than
+# employers. Their ``name`` ("JobStreet Indonesia") describes the board,
+# not the hiring company, so feeding it to ``Job.company`` would label
+# every advertiser on the site with the site's own name. The per-listing
+# employer these scrapers already parse is the correct value.
+_MULTI_EMPLOYER_ATSES = {"seek"}
+
+
+def test_every_single_employer_scraper_takes_a_company_name() -> None:
+    """Board slugs must not reach ``Job.company`` for CSV-driven ATSes.
+
+    The tenant CSV always has a curated ``name``; a scraper that can't
+    accept it silently publishes its slug and fragments the employer.
+    """
+    missing = sorted(
+        ats
+        for ats, cfg in runner.CONFIGS.items()
+        if not cfg.get("singleton")
+        and ats not in _MULTI_EMPLOYER_ATSES
+        and not runner._accepts_company_name(cfg["scraper"])
+    )
+    assert missing == []
+
+
+def test_aggregators_do_not_take_a_tenant_name() -> None:
+    """Guards the inverse: injecting a board name would mislabel rows."""
+    for ats in _MULTI_EMPLOYER_ATSES:
+        assert not runner._accepts_company_name(runner.CONFIGS[ats]["scraper"]), (
+            f"{ats} would now be fed its tenant CSV name as the employer"
+        )
+
+
 def test_oracle_dedupes_same_tenant_job_across_named_sites() -> None:
     first = Job(
         url="https://oracle.example/sites/english/jobs/1",

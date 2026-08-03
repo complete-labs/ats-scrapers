@@ -85,12 +85,14 @@ class MokaScraper(BaseScraper):
         include_descriptions: bool = True,
         proxy: str | None = None,
         host: str | None = None,
+        company_name: str | None = None,
     ) -> None:
         super().__init__(
             company_slug,
             timeout=timeout,
             include_descriptions=include_descriptions,
             proxy=proxy,
+            company_name=company_name,
         )
         slug_host, slug, site_id, recruitment_type = self._parse_slug(company_slug)
         self.slug = slug
@@ -162,7 +164,7 @@ class MokaScraper(BaseScraper):
         return Job(
             url=HttpUrl(self._job_url(ats_id)),
             title=title,
-            company=self.slug,
+            company=self.company_name or self.slug,
             ats_type=ATSType.MOKA,
             ats_id=ats_id,
             location=location,

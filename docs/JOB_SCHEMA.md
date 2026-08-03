@@ -15,14 +15,21 @@ the Pydantic descriptions are the source of truth; please update both.
 
 | Group | Fields |
 |---|---|
-| **Identity** | `global_id`, `url`, `title`, `company`, `ats_type`, `ats_id` |
+| **Identity** | `url`, `title`, `company`, `ats_type`, `ats_id` |
 | **Location** | `location`, `country_iso`, `region`, `lat`, `lon`, `is_remote` |
-| **Compensation** | `salary_currency`, `salary_period`, `salary_summary`, `salary_min`, `salary_max` |
-| **Classification** | `experience`, `employment_type`, `department`, `team`, `requisition_id`, `apply_url`, `commitment` |
-| **Content & timing** | `description`, `posted_at`, `fetched_at`, `language` |
+| **Compensation** | `salary_currency`, `salary_period`, `salary_summary`, `salary_min`, `salary_max`, `salary_source`, `offers_equity`, `offers_bonus`, `offers_commission` |
+| **Classification** | `seniority`, `experience`, `employment_type`, `department`, `team`, `requisition_id`, `apply_url`, `commitment` |
+| **Content & timing** | `description`, `posted_at`, `first_seen_at`, `last_seen_at`, `language` |
 | **Provider overflow** | `raw` |
 
-29 columns total in the published CSV.
+31 columns in the per-ATS `jobs.csv`. The assembled `all.parquet` adds
+three that only exist once the global snapshot is built:
+`salary_source` (cross-ATS pay inheritance) and
+`first_seen_at`/`last_seen_at` (observation window). 34 columns total.
+
+`global_id` and `fetched_at` are `Job` model fields that are **not**
+published: `global_id` is recomputed downstream from `ats_type` and
+`ats_id`, and `fetched_at` describes the scrape rather than the posting.
 
 > **Heuristic vs LLM split.** The publisher's hardcoded inference is
 > intentionally narrow: title-only `is_remote` (returns `True` or
@@ -77,6 +84,24 @@ identifies the posting within its source (for example, an Ashby UUID or
 Greenhouse numeric job id). Do not use `company` as a posting identifier;
 use `global_id` instead. For cross-ATS matching, combine normalized company
 data with `requisition_id` when both rows provide it.
+
+Scrapers prefer the curated `name` from the tenant CSV over the board
+slug or careers hostname, so one employer no longer splits into
+`anthropic` and `Anthropic` facets.
+
+**Postings that name no employer are not published.** Some sources
+withhold it — EURES fronts national job services that reveal the
+employer only after a candidate applies, so French rows say
+`non renseigné` and Spanish rows are blank. The scrapers pass those
+through verbatim, so the per-ATS slices still show what the source
+said, but the global snapshot drops any row whose employer is a
+localized "not specified" marker or a bare careers hostname like
+`jobs.bell.ca`.
+
+Dropped rows land in `quarantine.parquet` under the reason
+`placeholder_employer`. This is the highest-volume quarantine rule, so
+check that count before reading a fall in FR/ES row counts as a scraper
+regression.
 
 ### `ats_type` &nbsp;`ATSType` &nbsp;*(required)*
 
@@ -166,7 +191,21 @@ Salary fields work together: `salary_currency` + `salary_period` are
 metadata, `salary_min`/`salary_max` are the structured numeric range,
 `salary_summary` is the original string the ATS displays. When the ATS
 ships only the summary string, `salary_min`/`salary_max` are derived
-via `ats_scrapers.enrichment.parse_salary_range` at publish time.
+via `ats_scrapers.enrichment.parse_salary_range` at publish time. When
+it ships no salary field at all — the common case, including every
+Greenhouse board — they are recovered from the pay range in the
+`description` body via `parse_salary_block`.
+
+Base pay is not the whole package, so `offers_equity`,
+`offers_bonus`, and `offers_commission` record the other components
+when the ATS names them.
+
+**Rows with impossible pay are not published.** A range too large for
+its own period, or one whose `salary_period` contradicts its own
+`salary_summary` (declared `YEAR` next to a summary reading "per
+hour"), is dropped from the dataset and written to
+`quarantine.parquet` with the reason instead. The bounds are scaled by
+currency, so ¥6,000,000/year is kept while $8,600,000/year is not.
 
 ### `salary_currency` &nbsp;`str | None`
 
@@ -190,12 +229,63 @@ Original salary string as the ATS displays it.
 
 ### `salary_min`, `salary_max` &nbsp;`float | None`
 
-Lower / upper bounds in `salary_currency`. Either set directly by the
-scraper from a structured ATS field, or derived from `salary_summary`.
+Lower / upper bounds in `salary_currency`. Set directly by the scraper
+from a structured ATS field, derived from `salary_summary`, or lifted
+out of the `description` body in that order of preference — a range the
+ATS stated outright is never overwritten by one parsed from prose.
+
+Where a posting bands its pay by location ("Zone 1 / Zone 2 / Zone 3"),
+the bounds span every band, since all of them are advertised.
+
+### `offers_equity`, `offers_bonus`, `offers_commission` &nbsp;`bool | None`
+
+Whether the package includes that component. `True` only when the ATS
+says so outright; `None` otherwise. Like `is_remote`, these never
+assert `False` — a posting that doesn't mention equity is not thereby
+known to exclude it.
+
+Booleans rather than amounts because the amount is not disclosed: every
+equity, bonus, and commission component we have seen carries null
+values and a summary of the bare form `"Offers Equity"`. Useful mostly
+on sales roles, where base salary alone understates the offer.
+
+### `salary_source` &nbsp;`str | None` &nbsp;*(combined dataset only)*
+
+Present in `all.{csv,parquet}`, never in a per-source slice, and `None`
+on all but a small minority of rows. It names the source the pay came
+from when that source is **not** the one in `ats_type`.
+
+This happens when a posting exists both on a sign-in-walled board and
+on the employer's own ATS. The dataset keeps the employer's row so the
+link is openable, but those boards rarely publish pay while the gated
+one does — so the whole pay block (`salary_min`, `salary_max`,
+`salary_currency`, `salary_period`, `salary_summary`) is carried across
+and attributed here. A row that published its own salary keeps it and
+leaves this `None`.
 
 ---
 
 ## Classification
+
+### `seniority` &nbsp;`str | None`
+
+Rank named by the title, from a closed vocabulary: `INTERN`, `JUNIOR`,
+`MID`, `SENIOR`, `STAFF`, `PRINCIPAL`, `LEAD`, `MANAGER`, `DIRECTOR`,
+`EXECUTIVE`. Derived at publish time by `infer_seniority` unless the ATS
+supplies its own value, which wins.
+
+Reads the title only, and only its explicit rank words. Management rank
+takes precedence over an IC qualifier in front of it, so
+`"Senior Director, Sales"` is `DIRECTOR`, while `"Senior Product
+Manager"` is `SENIOR` because *product manager* names a function rather
+than a rank.
+
+`None` is common and deliberate. A plain `"Software Engineer"` is not
+`MID`: most employers omit the qualifier at their baseline level, and
+which level that is differs by employer. Titles where a rank word is
+used in a non-rank sense — `Staff Nurse`, `School Principal`,
+`Art Director`, `Senior Living Nurse`, `Lead Generation Specialist` —
+also return `None` rather than a wrong band.
 
 ### `experience` &nbsp;`int | None`
 
@@ -270,7 +360,35 @@ legacy ATSes.
 
 ### `fetched_at` &nbsp;`datetime | None`
 
-When ats-scrapers last saw this posting. UTC.
+When ats-scrapers last saw this posting. UTC. Model field only — see the
+column count above; use `last_seen_at` when reading `all.parquet`.
+
+### `first_seen_at` &nbsp;`datetime` &nbsp;*(all.parquet only)*
+
+The first publish in which this posting appeared, UTC. Carried forward
+between runs through a `first_seen.parquet` sidecar keyed on
+`ats_type|ats_id` (falling back to `url` where the source ships no id),
+so an employer editing a posting's URL does not reset its age.
+
+Use `last_seen_at - first_seen_at` for how long a posting has been up.
+Prefer it over `posted_at`, which is the employer's own claim, is absent
+on a large share of rows, and does not move when a posting is relisted.
+
+A posting that disappears and later returns starts a new clock — we
+cannot distinguish a relist from a fresh posting without a link-liveness
+sweep, which does not exist yet.
+
+### `last_seen_at` &nbsp;`datetime` &nbsp;*(all.parquet only)*
+
+Timestamp of the publish that produced this file, UTC — the same value
+on every row, because each run republishes only what the boards are
+currently serving.
+
+**This is not proof the posting is still open.** Boards routinely keep
+filled roles in their index, so a row can be `last_seen_at` today and
+long dead. Detecting that needs an out-of-band sweep of `url`; these
+columns exist so that sweep has somewhere to write and so staleness is
+measurable in the meantime.
 
 ### `language` &nbsp;`str | None`
 
@@ -324,8 +442,8 @@ a JSON string in CSV exports, native dict in parquet.
   `"32h/week"`). Display this.
 
 **`is_remote` and `salary_min/max` are sometimes derived** —
-the publisher fills them from `title` text (narrow, title-only) and
-`salary_summary` when the ATS doesn't ship them structured. The CSV
-/ parquet doesn't distinguish derived from source-provided values;
-if you need to tell them apart, look at the raw ATS payload via
-`raw`.
+the publisher fills them from `title` text (narrow, title-only), from
+`salary_summary`, and from the `description` body when the ATS doesn't
+ship them structured. The CSV / parquet doesn't distinguish derived
+from source-provided values; if you need to tell them apart, look at
+the raw ATS payload via `raw`.

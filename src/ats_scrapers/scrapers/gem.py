@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import html as html_mod
 import re
+from contextlib import suppress
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -252,7 +253,7 @@ class GemScraper(BaseScraper):
         return Job(
             url=f"{BASE_URL}/{self.company_slug}/{ext_id}",
             title=item["title"],
-            company=self.company_slug,
+            company=self.display_company,
             ats_type=ATSType.GEM,
             ats_id=str(ext_id),
             location=_extract_location(item.get("locations") or []),
@@ -277,17 +278,15 @@ def _apply_detail_to_job(job: Job, detail: dict[str, Any]) -> None:
         job.description = _html_unescape_for_desc(desc_html, cap=25_000) or None
 
     # Posted date — Gem ships ``firstPublishedTsSec`` (epoch seconds) and
-    # ``startDateTs`` (epoch seconds, *future* go-live). Prefer the
-    # publish timestamp; fall through to startDate if the role hasn't
-    # gone public yet.
-    for key in ("firstPublishedTsSec", "startDateTs"):
-        ts = detail.get(key)
-        if isinstance(ts, (int, float)) and ts > 0:
-            try:
-                job.posted_at = datetime.fromtimestamp(ts)
-                break
-            except (OSError, ValueError):
-                continue
+    # ``startDateTs``, a *future* go-live. Only the former is a
+    # publication date: filling ``posted_at`` from a go-live put 2027
+    # and 2028 rows at the top of "newest first" and inside a "past
+    # week" window. A role that hasn't gone public yet has no posted
+    # date, so leave it unset rather than inventing one.
+    ts = detail.get("firstPublishedTsSec")
+    if isinstance(ts, (int, float)) and ts > 0:
+        with suppress(OSError, ValueError):
+            job.posted_at = datetime.fromtimestamp(ts, tz=UTC)
 
     job_obj = detail.get("job") or {}
     if isinstance(job_obj, dict):

@@ -141,12 +141,14 @@ class iCIMSScraper(BaseScraper):  # noqa: N801  matches public iCIMS branding
         timeout: float = 30.0,
         include_descriptions: bool = True,
         proxy: str | None = None,
+        company_name: str | None = None,
     ) -> None:
         super().__init__(
             company_slug,
             timeout=timeout,
             include_descriptions=include_descriptions,
             proxy=proxy,
+            company_name=company_name,
         )
         slug = company_slug.strip()
         if slug.startswith(("http://", "https://")):
@@ -257,6 +259,9 @@ class iCIMSScraper(BaseScraper):  # noqa: N801  matches public iCIMS branding
         return jobs
 
     def _company_name(self) -> str:
+        # A curated name beats anything recoverable from the hostname.
+        if self.company_name:
+            return self.company_name
         # `careers-peraton.icims.com` → `peraton`
         # `uscareers-rws.icims.com` → `rws`
         host = self.base_url.replace("https://", "").replace("http://", "")

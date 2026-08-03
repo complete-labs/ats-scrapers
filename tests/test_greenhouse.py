@@ -54,6 +54,31 @@ def test_parses_basic_job(httpx_mock) -> None:
     assert job.location == "Remote"
 
 
+def test_board_company_name_beats_slug(httpx_mock) -> None:
+    """The board's own display name outranks the routing slug.
+
+    Publishing ``anthropic`` alongside another source's ``Anthropic``
+    splits one employer into two facets, so prefer the real name.
+    """
+    item = _job() | {"company_name": "Anthropic"}
+    httpx_mock.add_response(url=API, json={"jobs": [item]})
+    assert GreenhouseScraper("acme").fetch()[0].company == "Anthropic"
+
+
+def test_configured_company_name_beats_board(httpx_mock) -> None:
+    item = _job() | {"company_name": "Acme Inc."}
+    httpx_mock.add_response(url=API, json={"jobs": [item]})
+    jobs = GreenhouseScraper("acme", company_name="Acme").fetch()
+    assert jobs[0].company == "Acme"
+
+
+@pytest.mark.parametrize("board_name", [None, "", "   "])
+def test_falls_back_to_slug_without_a_name(httpx_mock, board_name) -> None:
+    item = _job() | {"company_name": board_name}
+    httpx_mock.add_response(url=API, json={"jobs": [item]})
+    assert GreenhouseScraper("acme").fetch()[0].company == "acme"
+
+
 def test_returns_empty_for_no_jobs(httpx_mock) -> None:
     httpx_mock.add_response(url=API, json={"jobs": []})
     assert GreenhouseScraper("acme").fetch() == []

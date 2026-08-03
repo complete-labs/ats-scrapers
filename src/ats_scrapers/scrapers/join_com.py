@@ -202,7 +202,7 @@ class JoinComScraper(BaseScraper):
         return Job(
             url=url,
             title=item["title"].strip(),
-            company=self.company_slug,
+            company=self.display_company,
             ats_type=ATSType.JOIN_COM,
             ats_id=str(item["id"]),
             location=location,
