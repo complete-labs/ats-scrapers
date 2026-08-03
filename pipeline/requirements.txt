@@ -25,3 +25,8 @@ linkify-it-py>=2.0
 # DescriptionCache (scripts/run_pipeline.py). Workday's cache uses it
 # to keep ~700k entries under 3 GB on disk.
 zstandard>=0.22
+# duckdb backs pipeline/company_enrichment: it reads selected columns
+# straight out of the remote all.parquet over HTTP range requests, so
+# cohort selection never downloads the whole jobs dataset, and it joins
+# the ~250 MB of SEC Form D quarterly TSVs without loading them into RAM.
+duckdb>=0.10

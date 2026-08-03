@@ -1,0 +1,51 @@
+ats,slug,verdict,note
+workday,tandemdiabetes/tandemdiabetes,correct,
+workable,smartfinancial,wrong,"SMBK is a Tennessee bank holding company; the board's jobs are all the SmartFinancial insurance marketplace in Newport Beach CA"
+greenhouse,rockstargames,correct,"identity right; market cap is Take-Two's, flagged market_cap_is_parent"
+greenhouse,lendingtree,correct,
+workday,copart/copart,correct,
+workday,solvenergy/solv_external_career,correct,"Nasdaq lists SOLV Energy Inc. Class A as MWH"
+lever,bumbleinc,correct,
+greenhouse,assuredguaranty,correct,
+workday,resmed/resmed_external_careers,correct,
+greenhouse,spire,wrong,"board redirects to spire.com (Spire Global, satellite data, Virginia); SR is Spire Inc, a Missouri gas utility"
+workday,rackspace/external,correct,
+greenhouse,kestramedicaltechnologiesinc,correct,
+greenhouse,striiminc,correct,
+jazzhr,resourcepro,correct,
+ashby,hiya,correct,
+workable,concept3d-dot-c-om,correct,
+greenhouse,dv01,correct,
+lever,3pillarglobal,correct,
+greenhouse,braincorporation,correct,
+icims,realpagepms,correct,
+greenhouse,bugcrowd,correct,
+greenhouse,iex,correct,"CIK right; no domain recovered"
+breezy,mytonomy-inc,correct,
+ashby,roboflow,correct,"CIK right; no domain recovered"
+bamboohr,berkshiregrey,correct,
+greenhouse,evio,wrong,"board is Evio, a pharmacy solutions company; EVIO Inc was an Oregon cannabis testing lab"
+bamboohr,aceelectric,correct,
+workday,americancentury/americancenturyinvestments,correct,
+bamboohr,ltsc,wrong,"ltsc.com.au is Australian; four-letter acronym collision"
+breezy,moser-consulting,correct,
+lever,hivemind-capital,correct,
+greenhouse,oath,wrong,"board is Oath Animal Hospital; OATH, INC. was Verizon's Yahoo/AOL holding entity"
+ashby,semgrep,correct,
+bamboohr,pos360,correct,
+jazzhr,kippcolorado,correct,
+rippling,vcheck,correct,
+ashby,polymarket,correct,
+jazzhr,cambridgeinternationalsystems,correct,
+smartrecruiters,volution,ambiguous,"board is 'Careers at Evolution'; could not confirm goevolution.com is the same Evolution"
+jazzhr,brooklynbridgeparkcorporation,correct,
+jazzhr,brightwayscounselinggroup,correct,
+jazzhr,levelonepersonnel,correct,
+workday,associatedbank/external_careers,correct,
+ashby,workos,wrong,"WorkOS is workos.com; workos.wixsite.com is an unrelated Wix site"
+bamboohr,heywood,no_claim,
+bamboohr,rrci,no_claim,"four-letter acronym, nothing to match on"
+workable,esselenvironmental,no_claim,
+greenhouse,mejuri,no_claim,"Canadian company, outside the US-only PDL slice by design"
+rippling,ampliwork-inc,no_claim,
+bamboohr,mansfieldhallaccount,no_claim,"tenant name is a mangled account label, not a company name"
