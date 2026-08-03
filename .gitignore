@@ -31,6 +31,9 @@ data/*.csv
 
 # Operator-side artefacts (kept locally, not part of the library)
 legacy/
+# Company enrichment outputs are private: firmographics derived from
+# SEC/PDL/Wikidata for internal use only, never published to R2.
+/company-enrichment/
 # Top-level scripts/ stays private; .github/scripts/ ships with the repo.
 /scripts/
 viewer/
