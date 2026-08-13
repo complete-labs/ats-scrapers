@@ -599,7 +599,10 @@ _COUNTRY_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("IE", ("ireland", "irlande", "irland")),
     ("CZ", ("česko", "czech", "tschechien")),
     ("US", ("united states", "u.s.a", "usa")),
-    ("GB", ("united kingdom", "england", "scotland", "wales")),
+    # "UK" is not the ISO code (GB is), so the trailing-two-letter path
+    # can never resolve it — postings written "London, UK" otherwise
+    # come out with no country at all.
+    ("GB", ("united kingdom", "england", "scotland", "wales", "uk", "u.k")),
     ("CA", ("canada",)),
 )
 
@@ -631,6 +634,117 @@ _COUNTRY_PATTERNS_RE: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
 )
 _COUNTRY_CODES = {country_code for country_code, _ in _COUNTRY_PATTERNS}
 
+# US states and Canadian provinces. Postings from North America almost
+# never name the country — they write ``"Austin, TX"`` / ``"Toronto,
+# ON"`` — so without these the largest slice of the corpus resolves to
+# nothing at all. Neither set overlaps the other.
+_US_STATE_CODES = frozenset({
+    "AK", "AL", "AR", "AZ", "CA", "CO", "CT", "DC", "DE", "FL", "GA",
+    "HI", "IA", "ID", "IL", "IN", "KS", "KY", "LA", "MA", "MD", "ME",
+    "MI", "MN", "MO", "MS", "MT", "NC", "ND", "NE", "NH", "NJ", "NM",
+    "NV", "NY", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX",
+    "UT", "VA", "VT", "WA", "WI", "WV", "WY",
+})
+_CA_PROVINCE_CODES = frozenset({
+    "AB", "BC", "MB", "NB", "NL", "NS", "NT", "NU", "ON", "PE", "QC",
+    "SK", "YT",
+})
+
+# Spelled-out state names, for the ``"Boulder, Colorado"`` /
+# ``"New York, New York"`` form that carries no two-letter token at all.
+# Georgia is deliberately absent: it is also a country, and
+# ``"Tbilisi, Georgia"`` must not resolve to the US.
+_US_STATE_NAMES = frozenset({
+    "alabama", "alaska", "arizona", "arkansas", "california", "colorado",
+    "connecticut", "delaware", "florida", "hawaii", "idaho", "illinois",
+    "indiana", "iowa", "kansas", "kentucky", "louisiana", "maine",
+    "maryland", "massachusetts", "michigan", "minnesota", "mississippi",
+    "missouri", "montana", "nebraska", "nevada", "new hampshire",
+    "new jersey", "new mexico", "new york", "north carolina",
+    "north dakota", "ohio", "oklahoma", "oregon", "pennsylvania",
+    "rhode island", "south carolina", "south dakota", "tennessee",
+    "texas", "utah", "vermont", "virginia", "washington",
+    "west virginia", "wisconsin", "wyoming", "district of columbia",
+})
+
+# Four two-letter codes mean both a US state and a country, so the code
+# alone can't decide. Each entry pairs a set of anchor components with
+# the verdict they force and the verdict to fall back on. The anchors and
+# the defaults are picked from what the corpus actually contains:
+# ``", CA"`` is California unless a province is spelled out beside it
+# (Canadian rows write ``"Toronto, ON, CA"``), ``", DE"`` is Germany
+# unless the city is one of Delaware's handful of towns, and ``", IN"`` /
+# ``", ID"`` are Indiana / Idaho unless anchored by a major Indian or
+# Indonesian city.
+_DELAWARE_CITIES = frozenset({
+    "wilmington", "newark", "dover", "middletown", "bear", "glasgow",
+    "smyrna", "milford", "seaford", "georgetown", "lewes", "claymont",
+    "hockessin", "christiana", "brookside", "elsmere", "milton", "camden",
+    "harrington", "laurel", "selbyville", "townsend", "delmar", "clayton",
+    "felton", "greenwood", "frankford", "millsboro", "edgemoor",
+    "new castle", "pike creek", "rehoboth beach", "bethany beach",
+    "dewey beach", "ocean view",
+})
+_INDIA_CITIES = frozenset({
+    "mumbai", "navi mumbai", "delhi", "new delhi", "bangalore",
+    "bengaluru", "hyderabad", "chennai", "kolkata", "pune", "ahmedabad",
+    "surat", "jaipur", "lucknow", "kanpur", "nagpur", "indore", "thane",
+    "bhopal", "visakhapatnam", "patna", "vadodara", "ghaziabad",
+    "ludhiana", "agra", "nashik", "faridabad", "meerut", "rajkot",
+    "gurgaon", "gurugram", "noida", "greater noida", "kochi", "cochin",
+    "coimbatore", "chandigarh", "mysore", "mysuru", "trivandrum",
+    "thiruvananthapuram", "bhubaneswar", "mohali", "vijayawada",
+    "madurai", "guwahati", "dehradun", "jodhpur", "raipur", "ranchi",
+    "amritsar",
+})
+_INDONESIA_CITIES = frozenset({
+    "jakarta", "south jakarta", "west jakarta", "north jakarta",
+    "east jakarta", "central jakarta", "surabaya", "bandung", "medan",
+    "bekasi", "semarang", "makassar", "palembang", "tangerang",
+    "south tangerang", "depok", "batam", "denpasar", "balikpapan",
+    "yogyakarta", "malang", "samarinda", "pekanbaru", "banjarmasin",
+    "bogor", "bali", "kalimantan", "kalimantan timur", "sumatera",
+    "sulawesi", "jawa",
+})
+
+# code -> (anchor components, verdict when anchored, verdict otherwise)
+_AMBIGUOUS_ADMIN_CODES: dict[str, tuple[frozenset[str], str, str]] = {
+    "CA": (_CA_PROVINCE_CODES, "CA", "US"),
+    "DE": (_DELAWARE_CITIES, "US", "DE"),
+    "IN": (_INDIA_CITIES, "IN", "US"),
+    "ID": (_INDONESIA_CITIES, "ID", "US"),
+}
+
+_COMPONENT_SPLIT_RE = re.compile(r"[,;|/]|\s+-\s+")
+
+
+def _location_components(loc: str) -> list[str]:
+    """Split a location on its separators.
+
+    Matching anchors against whole components rather than as substrings
+    is what keeps ``"Bear"`` (DE) from firing on ``"Bearsden"`` and
+    ``"ON"`` from firing on the English word "on".
+    """
+    return [part.strip() for part in _COMPONENT_SPLIT_RE.split(loc) if part.strip()]
+
+
+def _resolve_admin_code(code: str, components: list[str]) -> str:
+    """Map a trailing two-letter token to an ISO country code."""
+    ambiguous = _AMBIGUOUS_ADMIN_CODES.get(code)
+    if ambiguous is not None:
+        anchors, anchored, otherwise = ambiguous
+        for part in components:
+            if part.lower() in anchors or part.upper() in anchors:
+                return anchored
+        return otherwise
+    if code in _COUNTRY_CODES:
+        return code
+    if code in _US_STATE_CODES:
+        return "US"
+    if code in _CA_PROVINCE_CODES:
+        return "CA"
+    return ""
+
 
 def _country_iso_from_location(loc: object) -> str:
     """Heuristic ISO 3166-1 alpha-2 extraction from a free-form
@@ -638,9 +752,15 @@ def _country_iso_from_location(loc: object) -> str:
 
     Covers the patterns observed across the duplicate-prone EU
     aggregators: full country names in DE/FR/EN, NUTS-region prefixes
-    (``DE (DEA58)``), and ``"<City>, <Country>"`` suffixes.
+    (``DE (DEA58)``), and ``"<City>, <Country>"`` suffixes, plus the
+    ``"<City>, <ST>"`` form that North American postings use instead of
+    ever naming their country.
     Word-boundary-anchored so ``"Lausanne"`` doesn't get tagged as US
     via a substring match on ``"usa"``.
+
+    A spelled-out country always wins over a trailing two-letter token,
+    so ``"Toronto, ON, Canada"`` is Canada and ``"Remote-Friendly,
+    United States; San Francisco, CA"`` is the US.
     """
     if not isinstance(loc, str) or not loc.strip():
         return ""
@@ -652,11 +772,14 @@ def _country_iso_from_location(loc: object) -> str:
     m = _NUTS_PREFIX_RE.match(stripped)
     if m:
         return m.group(1).upper()
+    components = _location_components(stripped)
     m = _TRAILING_ISO_RE.search(stripped)
     if m:
-        code = m.group(1).upper()
-        if code in _COUNTRY_CODES:
-            return code
+        resolved = _resolve_admin_code(m.group(1).upper(), components)
+        if resolved:
+            return resolved
+    if any(part.lower() in _US_STATE_NAMES for part in components):
+        return "US"
     return ""
 
 
@@ -948,7 +1071,7 @@ def _phase2_fuzzy_drops(
 
     Returns the set of ``_orig_idx`` to drop.
     """
-    from rapidfuzz import fuzz
+    from rapidfuzz import fuzz, utils
 
     drop: set[int] = set()
     block_groups = work.filter(
@@ -986,7 +1109,18 @@ def _phase2_fuzzy_drops(
             for kept_title, kept_ats in kept:
                 if kept_ats == ats:
                     continue
-                if fuzz.token_set_ratio(title_raw, kept_title) >= threshold:
+                # ``default_process`` lowercases and drops punctuation
+                # before tokenising. Without it the comparison is done on
+                # raw display strings, where cosmetic differences alone
+                # sink the score below the threshold: "Senior Cloud
+                # Engineer" vs "senior cloud engineer" scores 86, and
+                # "Lead, Enterprise" vs "Lead (Enterprise)" scores 69.
+                if (
+                    fuzz.token_set_ratio(
+                        title_raw, kept_title, processor=utils.default_process
+                    )
+                    >= threshold
+                ):
                     matched = True
                     break
             if matched:

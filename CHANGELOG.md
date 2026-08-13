@@ -5,6 +5,101 @@ All notable changes to **ats-scrapers** are documented here. The project follows
 
 ## [Unreleased]
 
+### Fixed — Ashby accuracy
+
+- `is_remote` no longer reports hybrid roles as remote. Ashby sets
+  `isRemote: true` for hybrid *and* fully-remote postings, so the flag
+  alone overstated remote work by roughly a third of the board.
+  `workplaceType` is now the authoritative signal, and a bare
+  `isRemote: true` with no `workplaceType` resolves to `None` rather
+  than `True` — it only means "not fully on-site".
+- `salary_min` / `salary_max` now span every pay band on postings that
+  publish per-zone or per-level ranges, instead of reporting only the
+  first band. Affected rows previously contradicted their own
+  `salary_summary` (a `$165.4K – $285K` summary next to a `207000`
+  minimum).
+- `salary_period` is left `None` for compensation intervals we don't
+  recognize instead of defaulting to `YEAR`, which would publish a
+  short-period rate as an annual salary.
+
+### Added — Ashby structured location
+
+- `country_iso` and `region` are now populated from the posting's
+  `address.postalAddress`, covering ~93% of rows. They are withheld
+  when a posting spans several countries.
+- Multi-location postings render every office in `location` rather
+  than only the primary one.
+
+### Added — shared country resolver
+
+- `ats_scrapers.enrichment.geo` resolves an alpha-2 code, an alpha-3
+  code, or a country name to `country_iso` + `region`. Every ATS spells
+  countries differently — Lever sends `de`, Amazon sends `DEU`, Workday
+  sends `Germany` — and each scraper previously carried its own partial
+  table, so a country recognized on one source was dropped on another.
+  Supranational and "anywhere" values (`European Union`, `Global`)
+  resolve to nothing rather than to an arbitrary member state.
+
+### Added — structured location on the highest-volume sources
+
+Each of these ATSes already published a machine-readable country that
+was being discarded, leaving the publisher to infer one from free text:
+
+- **Workday**: `country_iso`, `region`, `posted_at`, `employment_type`
+  and `is_remote` are now read from the per-job detail payload the
+  scraper already fetches for descriptions, at no extra request cost.
+  `posted_at` was previously always `None` — the search endpoint only
+  reports a relative string ("Posted 30+ Days Ago") while the detail
+  payload carries an absolute `startDate`. Measured on a live sample:
+  country and posted date go from 0% to 99.7% of rows, employment type
+  from 51% to 99.3%.
+- **SmartRecruiters**: `country_iso`/`region` from `location.country`
+  (63% → ~100% of rows), plus `lat`/`lon` from the coordinates it
+  publishes for ~77% of postings — the first real geocodes in the
+  dataset. The display location no longer ends in a lowercase ISO code
+  ("Austin, TX, us").
+- **Oracle**: `country_iso`/`region` from `PrimaryLocationCountry`
+  (61% → ~100%).
+- **Lever**: `country_iso`/`region` from `country` (22% → ~98%).
+- **Amazon**: `country_iso`/`region` and `lat`/`lon` resolved per office,
+  so a posting spanning several countries no longer stamps the primary
+  country on every row. `is_remote` comes from each office's type —
+  Amazon spells fully-remote roles `VIRTUAL`, not `REMOTE`.
+- **Oracle**: `is_remote` now covers `ORA_HYBRID` as well as the remote
+  and on-site codes. Hybrid is the second most common value, so leaving
+  it unset stranded a third of the postings that state a workplace type.
+
+### Added — detail fields cached beside descriptions
+
+Providers whose extra fields only exist on a per-job detail endpoint can
+return them from the new `BaseScraper.get_description_and_fields` hook.
+The pipeline stores them in the description cache, so a cache hit is as
+complete as a fresh fetch — otherwise Workday's country and posted date
+would only ever be set for newly-seen listings, which on a board that is
+almost entirely cache hits means almost never.
+
+- `DescriptionCache` gains a nullable `metadata` column (schema v3).
+  Existing v2 caches are migrated in place; the ~700k cached Workday
+  descriptions are preserved rather than re-crawled.
+- Writing back only a description no longer clears the metadata beside
+  it.
+- Set `ATS_SCRAPERS_DETAIL_FIELD_BACKFILL=1` to re-fetch cache entries
+  that predate the metadata column. Off by default because it costs one
+  extra pass over the board; after that the fields are cached normally.
+
+### Fixed — cross-source consistency
+
+- Hybrid roles report `is_remote = False` on every scraper. Lever and
+  Workday left them `None` while Ashby reported `False`, so the field
+  meant different things on different sources.
+- `posted_at` is parsed as UTC in the seven scrapers that read epoch
+  timestamps (lever, eightfold, eures, gem, tiktok, getonbrd,
+  remoteok). They used a naive `datetime.fromtimestamp()`, which
+  silently shifted every timestamp by the pipeline host's UTC offset.
+- The publisher's location heuristic recognizes `UK`. It is not the ISO
+  code for the United Kingdom (`GB` is), so postings written
+  "London, UK" resolved to no country at all.
+
 ## [0.2.0] — 2026-07-23
 
 ### Added — company discovery without ATS knowledge

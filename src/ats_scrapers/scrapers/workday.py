@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 
+from ats_scrapers.enrichment.geo import resolve_country
 from ats_scrapers.exceptions import CompanyNotFoundError, ScraperError
 from ats_scrapers.models import ATSType, Job
 from ats_scrapers.scrapers.base import BaseScraper, ScraperRegistry
@@ -63,7 +64,12 @@ _TIMETYPE_TO_EMPLOYMENT_TYPE = {
 }
 
 # ``remoteType`` is a freeform string Workday tenants populate
-# inconsistently. Map the obvious values.
+# inconsistently. Map the obvious values. Hybrid is ``False`` — the role
+# requires office attendance, so it cannot be performed remotely — which
+# matches the convention used by the Ashby and Lever scrapers. Vaguer
+# tenant-specific labels ("Flex", "Flexible") stay ``None``: they may mean
+# hybrid or may mean flexible hours, and guessing either way is worse than
+# admitting we don't know.
 _REMOTE_TYPE_PATTERNS = {
     "remote": True,
     "fully remote": True,
@@ -76,7 +82,7 @@ _REMOTE_TYPE_PATTERNS = {
     "in office": False,
     "in-office": False,
     "office": False,
-    # ``flexible``, ``hybrid`` etc. stay None — neither purely remote nor onsite.
+    "hybrid": False,
 }
 QUERY_TOTAL_CAP = 2000  # On capped tenants, total is reported as exactly 2000
                        # and pagination past offset=2000 wraps to page 1.
@@ -108,12 +114,23 @@ _TAG_RE = re.compile(r"<[^>]+>")
 # tenants like Accenture's Software Engineering (32K jobs in one area).
 _SUBDIVISION_FACETS = ("jobFamilyGroup", "timeType", "locations", "workerSubType")
 
+# Fields the detail endpoint supplies that the search endpoint cannot. They
+# travel with the description so a caching caller can persist them together.
+_DETAIL_FIELDS = (
+    "country_iso",
+    "region",
+    "posted_at",
+    "employment_type",
+    "is_remote",
+)
+
 
 @ScraperRegistry.register(ATSType.WORKDAY)
 class WorkdayScraper(BaseScraper):
     """Workday scraper — `company_slug` must be the full careers URL."""
 
     ats = ATSType.WORKDAY
+    provides_detail_fields = True
 
     def __init__(
         self,
@@ -191,26 +208,46 @@ class WorkdayScraper(BaseScraper):
             )
 
     def get_description(self, job: Job) -> str | None:
-        if job.description:
-            return job.description
+        return self.get_description_and_fields(job)[0]
+
+    def get_description_and_fields(
+        self, job: Job
+    ) -> tuple[str | None, dict[str, Any]]:
+        """Return the posting body plus the fields that ride along with it.
+
+        The detail endpoint answers with ``country``, ``startDate``,
+        ``timeType`` and ``remoteType`` as well as the description, and the
+        search endpoint cannot supply any of them. Handing them back here
+        keeps them from being thrown away on pipelines that fetch
+        descriptions one job at a time through a cache.
+        """
         match = URL_PATTERN.match(self.company_slug.rstrip("/"))
         if not match:
-            return None
+            return job.description, {}
         company = match.group("company")
         instance = match.group("instance")
         site = match.group("site")
         detail_prefix = f"https://{company}.{instance}.myworkdayjobs.com/wday/cxs/{company}/{site}"
-        jobs = [job.model_copy()]
+        probe = job.model_copy()
 
-        async def run() -> str | None:
+        async def run() -> Job:
+            jobs = [probe]
             async with httpx.AsyncClient(
                 timeout=self.timeout, follow_redirects=True, proxy=self.proxy,
             ) as client:
-                sem = asyncio.Semaphore(1)
-                await self._enrich_details(client, sem, detail_prefix, jobs)
-            return jobs[0].description
+                await self._enrich_details(
+                    client, asyncio.Semaphore(1), detail_prefix, jobs
+                )
+            return jobs[0]
 
-        return self._run_sync(run())
+        hydrated = self._run_sync(run())
+        fields = {
+            name: value
+            for name in _DETAIL_FIELDS
+            if (value := getattr(hydrated, name)) is not None
+            and getattr(job, name) is None
+        }
+        return hydrated.description, fields
 
     async def _fetch_all(
         self,
@@ -261,6 +298,13 @@ class WorkdayScraper(BaseScraper):
         ``externalPath``. It also exposes real locations for search rows whose
         ``locationsText`` is only a rollup string like ``"2 Locations"``.
 
+        The same payload carries the four fields the search response either
+        omits or only reports relatively — ``startDate`` (an absolute date
+        where ``postedOn`` is "Posted 30+ Days Ago"), ``country``,
+        ``timeType`` and ``remoteType``. They are read here because this
+        request is already being made; the search endpoint cannot supply
+        them at any price.
+
         Detail failures stay non-fatal: a blocked/moved single posting should
         not discard the listing row or the rest of the tenant.
         """
@@ -294,7 +338,7 @@ class WorkdayScraper(BaseScraper):
             except ValueError:
                 return
             jpi = payload.get("jobPostingInfo") or {}
-            updates: dict[str, str] = {}
+            updates: dict[str, Any] = {}
 
             description = _extract_description(jpi)
             if description and not job.description:
@@ -306,6 +350,31 @@ class WorkdayScraper(BaseScraper):
                 resolved = _format_locations(primary, additional)
                 if resolved:
                     updates["location"] = resolved
+
+            if job.country_iso is None:
+                country_iso, region = resolve_country(
+                    (jpi.get("country") or {}).get("descriptor")
+                    if isinstance(jpi.get("country"), dict)
+                    else None
+                )
+                if country_iso:
+                    updates["country_iso"] = country_iso
+                    updates["region"] = region
+
+            if job.posted_at is None:
+                posted_at = _parse_start_date(jpi.get("startDate"))
+                if posted_at:
+                    updates["posted_at"] = posted_at
+
+            if job.employment_type is None:
+                employment_type = _map_time_type(jpi.get("timeType"))
+                if employment_type:
+                    updates["employment_type"] = employment_type
+
+            if job.is_remote is None:
+                is_remote = _map_remote_type(jpi.get("remoteType"))
+                if is_remote is not None:
+                    updates["is_remote"] = is_remote
 
             if updates:
                 jobs[i] = job.model_copy(update=updates)
@@ -502,31 +571,8 @@ class WorkdayScraper(BaseScraper):
             if isinstance(time_type, str) and time_type.strip()
             else None
         )
-        employment_type: str | None = None
-        if commitment:
-            norm = commitment.strip().lower().replace("-", " ")
-            employment_type = _TIMETYPE_TO_EMPLOYMENT_TYPE.get(norm)
-            if not employment_type:
-                for needle, mapped in _TIMETYPE_TO_EMPLOYMENT_TYPE.items():
-                    if needle in norm:
-                        employment_type = mapped
-                        break
-
-        # ``remoteType`` is freeform — Workday tenants populate things
-        # like "Remote", "Fully Remote", "Hybrid", "On-site", or
-        # nothing. Map the unambiguous extremes; hybrid stays None.
-        remote_type = item.get("remoteType")
-        is_remote: bool | None = None
-        if isinstance(remote_type, str) and remote_type.strip():
-            norm = remote_type.strip().lower()
-            if norm in _REMOTE_TYPE_PATTERNS:
-                is_remote = _REMOTE_TYPE_PATTERNS[norm]
-            elif "remote" in norm and "hybrid" not in norm:
-                is_remote = True
-            elif "hybrid" not in norm and (
-                "site" in norm or "office" in norm
-            ):
-                is_remote = False
+        employment_type = _map_time_type(time_type)
+        is_remote = _map_remote_type(item.get("remoteType"))
 
         # Department from ``jobFamilyGroup`` when populated (it's the
         # highest-level facet Workday surfaces in the listing — also
@@ -567,10 +613,65 @@ class WorkdayScraper(BaseScraper):
 
 
 def _parse_workday_date(value: str | None) -> datetime | None:
-    """Workday's `postedOn` is a relative string like 'Posted 30+ Days Ago'."""
+    """Workday's ``postedOn`` is a relative string like 'Posted 30+ Days Ago'.
+
+    There is nothing to parse into an absolute timestamp. ``posted_at`` is
+    instead filled from ``jobPostingInfo.startDate`` during detail
+    hydration — see :meth:`WorkdayScraper._enrich_details`.
+    """
     if not value:
         return None
-    return None  # Relative; absolute date requires fetching the per-job detail.
+    return None
+
+
+def _parse_start_date(value: object) -> datetime | None:
+    """Parse the detail endpoint's ``startDate`` (a bare ``YYYY-MM-DD``).
+
+    Workday states no timezone, so the date is anchored at UTC midnight
+    rather than the scraping host's local zone.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _map_time_type(value: object) -> str | None:
+    """Map Workday's ``timeType`` ("Full time") onto the employment enum."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    norm = value.strip().lower().replace("-", " ")
+    mapped = _TIMETYPE_TO_EMPLOYMENT_TYPE.get(norm)
+    if mapped:
+        return mapped
+    for needle, candidate in _TIMETYPE_TO_EMPLOYMENT_TYPE.items():
+        if needle in norm:
+            return candidate
+    return None
+
+
+def _map_remote_type(value: object) -> bool | None:
+    """Map Workday's freeform ``remoteType`` onto ``is_remote``.
+
+    Tenants populate anything from "Remote" to "Fully Remote" to "Hybrid"
+    to nothing at all. Only the unambiguous ends resolve; a label that
+    mentions hybrid is never reported as remote.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    norm = value.strip().lower()
+    if norm in _REMOTE_TYPE_PATTERNS:
+        return _REMOTE_TYPE_PATTERNS[norm]
+    if "hybrid" in norm:
+        return False
+    if "remote" in norm:
+        return True
+    if "site" in norm or "office" in norm:
+        return False
+    return None
 
 
 def _external_path(url: object) -> str | None:

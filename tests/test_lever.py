@@ -57,3 +57,46 @@ def test_5xx_retries(httpx_mock) -> None:
     httpx_mock.add_response(url=API, status_code=502)
     httpx_mock.add_response(url=API, json=[_job()])
     assert len(LeverScraper("acme").fetch()) == 1
+
+
+@pytest.mark.parametrize(
+    ("workplace_type", "expected"),
+    [
+        ("remote", True),
+        ("onsite", False),
+        ("on-site", False),
+        # Hybrid requires office attendance, so the role is not remote.
+        # Matches the convention used by the Ashby and Workday scrapers.
+        ("hybrid", False),
+        ("", None),
+    ],
+)
+def test_workplace_type_decides_is_remote(httpx_mock, workplace_type, expected) -> None:
+    httpx_mock.add_response(url=API, json=[_job() | {"workplaceType": workplace_type}])
+    assert LeverScraper("acme").fetch()[0].is_remote is expected
+
+
+def test_country_code_populates_country_iso(httpx_mock) -> None:
+    """Lever ships an alpha-2 ``country`` that used to sit unused in
+    ``raw``, leaving the publisher to guess from the location text."""
+    httpx_mock.add_response(url=API, json=[_job(location="Berlin") | {"country": "DE"}])
+    job = LeverScraper("acme").fetch()[0]
+    assert job.country_iso == "DE"
+    assert job.region == "Europe"
+
+
+def test_missing_country_leaves_iso_unset(httpx_mock) -> None:
+    httpx_mock.add_response(url=API, json=[_job()])
+    job = LeverScraper("acme").fetch()[0]
+    assert job.country_iso is None
+    assert job.region is None
+
+
+def test_posted_at_is_utc_not_host_local(httpx_mock) -> None:
+    """``createdAt`` is epoch milliseconds; parsing it without a timezone
+    silently shifted every timestamp by the pipeline host's UTC offset."""
+    httpx_mock.add_response(url=API, json=[_job() | {"createdAt": 1767225600000}])
+    posted_at = LeverScraper("acme").fetch()[0].posted_at
+    assert posted_at is not None
+    assert posted_at.tzinfo is not None
+    assert (posted_at.year, posted_at.month, posted_at.day) == (2026, 1, 1)

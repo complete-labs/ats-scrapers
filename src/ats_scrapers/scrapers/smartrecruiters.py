@@ -24,6 +24,7 @@ import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from ats_scrapers.enrichment.geo import resolve_country
 from ats_scrapers.exceptions import ScraperError
 from ats_scrapers.models import ATSType, Job
 from ats_scrapers.scrapers.base import BaseScraper, ScraperRegistry
@@ -137,16 +138,28 @@ class SmartRecruitersScraper(BaseScraper):
         loc_str = _format_location(location) if isinstance(location, dict) else None
 
         # ``location.remote`` is an explicit bool; ``country == "remote"``
-        # is the legacy convention some tenants still use.
+        # is the legacy convention some tenants still use. ``location.hybrid``
+        # is a separate bool — a hybrid role is not remote, matching the
+        # convention used across the other scrapers.
         is_remote: bool | None = None
         if isinstance(location, dict):
             remote_flag = location.get("remote")
-            if (isinstance(remote_flag, bool) and remote_flag) or (
+            if location.get("hybrid") is True:
+                is_remote = False
+            elif (isinstance(remote_flag, bool) and remote_flag) or (
                 location.get("country") == "remote"
             ):
                 is_remote = True
             elif isinstance(remote_flag, bool):
                 is_remote = False  # explicitly non-remote
+
+        # ``location.country`` is a lowercase ISO 3166-1 alpha-2 code, and
+        # ``latitude``/``longitude`` are real geocodes — SmartRecruiters is
+        # one of the very few ATSes that publishes coordinates.
+        country_iso, region = resolve_country(
+            location.get("country") if isinstance(location, dict) else None
+        )
+        lat, lon = _coordinates(location)
 
         department = (
             item.get("department", {}).get("label")
@@ -192,6 +205,10 @@ class SmartRecruitersScraper(BaseScraper):
             ats_type=ATSType.SMARTRECRUITERS,
             ats_id=item["id"],
             location=loc_str,
+            country_iso=country_iso,
+            region=region,
+            lat=lat,
+            lon=lon,
             is_remote=is_remote,
             department=department,
             team=team,
@@ -239,12 +256,44 @@ def _apply_detail_to_job(job: Job, detail: dict[str, Any]) -> None:
 
 
 def _format_location(location: dict[str, Any]) -> str | None:
-    parts = [
-        str(location[k]).strip()
-        for k in ("city", "region", "country")
-        if isinstance(location.get(k), str) and location.get(k).strip()
-    ]
+    """Render the display location.
+
+    ``fullLocation`` is SmartRecruiters' own rendering ("Austin, TX,
+    United States") and reads better than anything we can assemble.
+    Falling back to the parts, ``country`` is a lowercase ISO code, so
+    it gets upper-cased rather than published as "Waltham, MA, us".
+    """
+    full = location.get("fullLocation")
+    if isinstance(full, str) and full.strip():
+        # Tenants with no region produce "LILLEBONNE, , France" — drop the
+        # empty segment rather than publishing the double comma.
+        tidied = ", ".join(seg.strip() for seg in full.split(",") if seg.strip())
+        if tidied:
+            return tidied
+    parts: list[str] = []
+    for key in ("city", "region", "country"):
+        value = location.get(key)
+        if isinstance(value, str) and value.strip():
+            text = value.strip()
+            parts.append(text.upper() if key == "country" and len(text) == 2 else text)
     return ", ".join(parts) or None
+
+
+def _coordinates(location: object) -> tuple[float | None, float | None]:
+    """Pull WGS-84 coordinates, which SmartRecruiters ships as strings."""
+    if not isinstance(location, dict):
+        return None, None
+    try:
+        lat = float(location["latitude"])
+        lon = float(location["longitude"])
+    except (KeyError, TypeError, ValueError):
+        return None, None
+    # (0, 0) is the classic "unset" sentinel, not a job in the Gulf of Guinea.
+    if lat == 0.0 and lon == 0.0:
+        return None, None
+    if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
+        return None, None
+    return lat, lon
 
 
 def _map_employment_type(value: object) -> str | None:

@@ -35,8 +35,9 @@ import asyncio
 import json
 import re
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
+from ats_scrapers.enrichment.geo import country_to_iso, region_for
 from ats_scrapers.models import ATSType, Job
 from ats_scrapers.scrapers.base import BaseScraper, ScraperRegistry
 
@@ -221,10 +222,19 @@ class AmazonScraper(BaseScraper):
             or item.get("normalized_location")
             or item.get("location")
         )
-        if primary_location and primary_location not in locations:
-            locations = [primary_location, *locations]
+        # The posting-level ``country_code`` is an alpha-3 describing the
+        # primary office; it is the fallback for offices the ``locations``
+        # array doesn't describe.
+        fallback_iso = country_to_iso(
+            item.get("country_code") or item.get("countryCode")
+        )
+        if primary_location and primary_location not in {
+            loc.label for loc in locations
+        }:
+            locations = [_AmazonLocation(label=primary_location), *locations]
         if not locations:
-            locations = [primary_location] if primary_location else [None]
+            # Still emit exactly one row when the posting names no office.
+            locations = [_AmazonLocation(label=primary_location)]
 
         # Stable per-location ats_id so the runner's dedup keeps each
         # office posting. Single-location jobs keep the bare req_id.
@@ -246,8 +256,10 @@ class AmazonScraper(BaseScraper):
                 if v not in (None, "", []):
                     raw[src] = v
             if len(locations) > 1:
-                raw["all_locations"] = [loc for loc in locations if loc]
+                raw["all_locations"] = [o.label for o in locations if o.label]
                 raw["location_index"] = idx
+
+            country_iso = loc.country_iso or fallback_iso
 
             rows.append(Job(
                 url=url,
@@ -255,7 +267,12 @@ class AmazonScraper(BaseScraper):
                 company=company,
                 ats_type=ATSType.AMAZON,
                 ats_id=ats_id,
-                location=loc,
+                location=loc.label,
+                country_iso=country_iso,
+                region=region_for(country_iso),
+                lat=loc.lat,
+                lon=loc.lon,
+                is_remote=loc.is_remote,
                 department=department,
                 team=team_label,
                 description=description,
@@ -312,14 +329,39 @@ def _parse_amazon_date(value: object) -> datetime | None:
         return None
 
 
-def _decode_locations(item: dict[str, object]) -> list[str]:
-    """Return a list of unique ``normalizedLocation`` strings from the
-    ``locations`` field. The GET endpoint serialises each entry as a
-    JSON string; the POST endpoint returns dicts. Tolerate both."""
+# Each entry in ``locations`` states how the office is worked. Amazon
+# spells fully-remote roles "VIRTUAL" rather than "REMOTE".
+_LOCATION_TYPE_REMOTE = {
+    "VIRTUAL": True,
+    "REMOTE": True,
+    "ONSITE": False,
+    "ON_SITE": False,
+    "HYBRID": False,
+}
+
+
+class _AmazonLocation(NamedTuple):
+    label: str | None
+    country_iso: str | None = None
+    lat: float | None = None
+    lon: float | None = None
+    is_remote: bool | None = None
+
+
+def _decode_locations(item: dict[str, object]) -> list[_AmazonLocation]:
+    """Return the unique offices attached to a posting.
+
+    The GET endpoint serialises each entry as a JSON string; the POST
+    endpoint returns dicts. Tolerate both. Beyond the display label, each
+    entry carries ``countryIso2a`` and a ``"lat,lon"`` ``coordinates``
+    pair — Amazon is one of the few sources that publishes real geocodes,
+    and a multi-country posting needs the country resolved per office
+    rather than from the top-level primary.
+    """
     raw_list = item.get("locations")
     if not isinstance(raw_list, list):
         return []
-    out: list[str] = []
+    out: list[_AmazonLocation] = []
     seen: set[str] = set()
     for entry in raw_list:
         d: dict[str, object] | None = None
@@ -335,10 +377,43 @@ def _decode_locations(item: dict[str, object]) -> list[str]:
         if d is None:
             continue
         label = d.get("normalizedLocation") or d.get("location")
-        if isinstance(label, str) and label and label not in seen:
-            seen.add(label)
-            out.append(label)
+        if not isinstance(label, str) or not label or label in seen:
+            continue
+        seen.add(label)
+        lat, lon = _parse_coordinates(d.get("coordinates"))
+        location_type = d.get("type")
+        out.append(
+            _AmazonLocation(
+                label=label,
+                country_iso=country_to_iso(
+                    d.get("countryIso2a") or d.get("normalizedCountryCode")
+                ),
+                lat=lat,
+                lon=lon,
+                is_remote=_LOCATION_TYPE_REMOTE.get(
+                    location_type.strip().upper()
+                    if isinstance(location_type, str)
+                    else ""
+                ),
+            )
+        )
     return out
+
+
+def _parse_coordinates(value: object) -> tuple[float | None, float | None]:
+    """Split Amazon's ``"47.60357,-122.32945"`` coordinate string."""
+    if not isinstance(value, str) or "," not in value:
+        return None, None
+    lat_text, _, lon_text = value.partition(",")
+    try:
+        lat, lon = float(lat_text), float(lon_text)
+    except ValueError:
+        return None, None
+    if lat == 0.0 and lon == 0.0:
+        return None, None
+    if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
+        return None, None
+    return lat, lon
 
 
 def _extract_team_label(item: dict[str, object]) -> str | None:

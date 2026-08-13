@@ -131,6 +131,28 @@ class BaseScraper(ABC):
         """
         return job.description
 
+    #: Whether :meth:`get_description_and_fields` returns more than a body.
+    #: Lets a caching caller tell the difference between "this job has no
+    #: extra fields" and "this provider never had any to give", which is
+    #: what decides whether an old cache entry is worth re-fetching.
+    provides_detail_fields: ClassVar[bool] = False
+
+    def get_description_and_fields(
+        self, job: Job
+    ) -> tuple[str | None, dict[str, Any]]:
+        """Fetch the description plus any other fields the same request yields.
+
+        Some providers answer a per-job detail request with far more than a
+        body — Workday returns the country, absolute posting date and time
+        type alongside it. Returning those here lets a caller persist them
+        next to the description instead of paying for the request and
+        discarding everything but the text.
+
+        The returned mapping holds ``Job`` field names; the default is empty
+        because most providers have nothing extra to give.
+        """
+        return self.get_description(job), {}
+
     def enrich_descriptions(self, jobs: list[Job]) -> list[Job]:
         """Fill missing descriptions in ``jobs`` when the provider supports it.
 

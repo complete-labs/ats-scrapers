@@ -135,7 +135,11 @@ asyncio_mode = "auto"
 # gated: deselected by default (`-m "not live"`) AND skipped unless
 # ATS_SCRAPERS_LIVE_E2E=1. Run them with:
 #   ATS_SCRAPERS_LIVE_E2E=1 pytest -m live
-addopts = "-ra --strict-markers -m 'not live'"
+addopts = "-ra --strict-markers -m 'not live and not enrich_eval'"
 markers = [
     "live: hits real ATS endpoints / the hosted dataset (opt-in)",
+    # Enrichment quality gates in tests/enrich/. Deselected by default
+    # because they need data/all.parquet and (for real scores) a model key;
+    # run with: pytest -m enrich_eval
+    "enrich_eval: scores the enrichment pipeline against the gold sets (opt-in)",
 ]

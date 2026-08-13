@@ -558,7 +558,7 @@ def _epoch_ms_to_dt(value: object) -> datetime | None:
         return None
     if ms <= 0:
         return None
-    return datetime.fromtimestamp(ms / 1000)
+    return datetime.fromtimestamp(ms / 1000, tz=UTC)
 
 
 def _flatten_location(loc_map: dict[str, Any]) -> str | None:

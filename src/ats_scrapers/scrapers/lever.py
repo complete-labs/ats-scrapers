@@ -20,6 +20,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from ats_scrapers.enrichment.geo import resolve_country
 from ats_scrapers.models import ATSType, Job
 from ats_scrapers.scrapers.base import BaseScraper, ScraperRegistry
 
@@ -149,9 +150,15 @@ class LeverScraper(BaseScraper):
         wp = (item.get("workplaceType") or "").lower()
         if wp == "remote":
             is_remote = True
-        elif wp in {"on-site", "onsite", "in-office"}:
+        elif wp in {"on-site", "onsite", "in-office", "hybrid"}:
+            # Hybrid is False, not None: the role requires office
+            # attendance, so it cannot be performed remotely. Same
+            # convention as Ashby and Workday so the field means one
+            # thing across the dataset.
             is_remote = False
-        # ``hybrid`` stays None — neither purely remote nor onsite.
+
+        # ``country`` is already an ISO 3166-1 alpha-2 code on the posting.
+        country_iso, region = resolve_country(item.get("country"))
 
         return Job(
             url=item["hostedUrl"],
@@ -160,6 +167,8 @@ class LeverScraper(BaseScraper):
             ats_type=ATSType.LEVER,
             ats_id=item["id"],
             location=categories.get("location"),
+            country_iso=country_iso,
+            region=region,
             department=categories.get("department"),
             team=categories.get("team"),
             commitment=commitment,
@@ -181,6 +190,6 @@ def _parse_ms(value: int | None) -> datetime | None:
     if value is None:
         return None
     try:
-        return datetime.fromtimestamp(value / 1000)
+        return datetime.fromtimestamp(value / 1000, tz=UTC)
     except (ValueError, OSError):
         return None

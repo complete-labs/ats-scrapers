@@ -891,6 +891,86 @@ def test_phase2_oversize_block_skipped(caplog):
     assert sum(s.height for s in survivors.values()) == 40
 
 
+def test_greenhouse_wins_over_welcometothejungle_mirror():
+    """welcometothejungle mirrors postings that employers run on
+    greenhouse. Both copies used to survive, because the greenhouse row
+    resolved its country to ``""``/``CA`` off ``"San Francisco, CA"``
+    while the wttj row resolved to ``US`` — different Pass 4 keys and
+    different Pass 5 blocks, so the two were never compared. The
+    published result was a duplicate whose only priced copy was labelled
+    welcometothejungle.
+    """
+    import polars as pl
+
+    from pipeline.publisher import (
+        _country_iso_from_location,
+        _decide_dedup_survivors_polars,
+    )
+
+    variants = [
+        # (greenhouse title, greenhouse location, wttj title, wttj location)
+        ("Applied AI Security Architect", "San Francisco, CA",
+         "Applied AI Security Architect", "San Francisco, United States"),
+        ("Brand Marketing Lead, Enterprise", "San Francisco, CA",
+         "Brand Marketing Lead (Enterprise)", "San Francisco, United States"),
+        ("Capital Markets - Infrastructure Financing", "New York, NY",
+         "Capital Markets (Infrastructure Financing)", "New York, United States"),
+        ("Senior Cloud Engineer", "Boulder, Colorado",
+         "senior cloud engineer", "Boulder, CO, United States"),
+    ]
+
+    for gh_title, gh_loc, w_title, w_loc in variants:
+        keys = pl.DataFrame([
+            {
+                "_local_idx": 0, "_orig_idx": 0, "_priority": 1,
+                "ats_type": "greenhouse", "url": "https://job-boards.greenhouse.io/x/1",
+                "title_raw": gh_title, "title": gh_title.lower(),
+                "company": "acme", "location": gh_loc.lower(),
+                "country_iso": _country_iso_from_location(gh_loc), "ats_id": "1",
+            },
+            {
+                "_local_idx": 0, "_orig_idx": 1, "_priority": 3,
+                "ats_type": "welcometothejungle",
+                "url": "https://www.welcometothejungle.com/en/companies/x/jobs/1",
+                "title_raw": w_title, "title": w_title.lower(),
+                "company": "acme", "location": w_loc.lower(),
+                "country_iso": _country_iso_from_location(w_loc), "ats_id": "2",
+            },
+        ])
+        survivors = _decide_dedup_survivors_polars(keys)
+        assert sorted(survivors) == ["greenhouse"], (
+            f"{gh_title!r} @ {gh_loc!r} vs {w_title!r} @ {w_loc!r} "
+            f"survived as {sorted(survivors)}"
+        )
+
+
+def test_distinct_roles_at_one_company_are_not_merged():
+    """Guard against the fuzzy pass over-collapsing now that titles are
+    normalised before comparison."""
+    import polars as pl
+
+    from pipeline.publisher import _decide_dedup_survivors_polars
+
+    keys = pl.DataFrame([
+        {
+            "_local_idx": 0, "_orig_idx": 0, "_priority": 1,
+            "ats_type": "greenhouse", "url": "https://gh/1",
+            "title_raw": "Staff Backend Engineer", "title": "staff backend engineer",
+            "company": "acme", "location": "san francisco, ca",
+            "country_iso": "US", "ats_id": "1",
+        },
+        {
+            "_local_idx": 0, "_orig_idx": 1, "_priority": 3,
+            "ats_type": "welcometothejungle", "url": "https://wttj/1",
+            "title_raw": "Head of Global Benefits", "title": "head of global benefits",
+            "company": "acme", "location": "san francisco, united states",
+            "country_iso": "US", "ats_id": "2",
+        },
+    ])
+    survivors = _decide_dedup_survivors_polars(keys)
+    assert sorted(survivors) == ["greenhouse", "welcometothejungle"]
+
+
 # --- helper-function unit tests ---------------------------------------------
 
 
@@ -944,6 +1024,64 @@ def test_country_iso_uses_word_boundaries():
     assert f(None) == ""
     assert f("Remote") == ""
     assert f("Remote, XX") == ""
+
+
+def test_country_iso_resolves_north_american_admin_codes():
+    """North American postings write ``"City, ST"`` and never name the
+    country. The extractor used to recognise only country codes, so
+    ``"New York, NY"`` resolved to nothing and ``"San Francisco, CA"``
+    resolved to *Canada* — which split greenhouse rows away from their
+    welcometothejungle duplicates in the Pass 4 / Pass 5 dedup blocks."""
+    from pipeline.publisher import _country_iso_from_location as f
+
+    assert f("San Francisco, CA") == "US"
+    assert f("New York, NY") == "US"
+    assert f("Austin, TX") == "US"
+    assert f("Washington, DC") == "US"
+    # Multi-site postings resolve off the trailing site.
+    assert f("San Francisco, CA | New York City, NY") == "US"
+    # Spelled-out state names carry no two-letter token at all.
+    assert f("Boulder, Colorado") == "US"
+    assert f("New York, New York") == "US"
+    # Canadian provinces, with and without the country code beside them.
+    assert f("Toronto, ON") == "CA"
+    assert f("Vancouver, BC, CA") == "CA"
+    assert f("Toronto, ON, Canada") == "CA"
+
+
+def test_country_iso_disambiguates_state_country_code_collisions():
+    """``CA``/``DE``/``IN``/``ID`` are each both a US state and a
+    country. The neighbouring components decide, with the fallback set
+    from what the corpus actually contains for each code."""
+    from pipeline.publisher import _country_iso_from_location as f
+
+    # CA: Canadian rows spell out the province beside the country code.
+    assert f("San Francisco, CA") == "US"
+    assert f("Calgary, AB, CA") == "CA"
+    # DE: Germany is the common case; Delaware has a closed set of towns.
+    assert f("Berlin, DE") == "DE"
+    assert f("Hamburg, DE") == "DE"
+    assert f("Wilmington, DE") == "US"
+    assert f("Newark, DE") == "US"
+    # IN / ID: Indiana and Idaho unless anchored by a major city.
+    assert f("Indianapolis, IN") == "US"
+    assert f("Mumbai, IN") == "IN"
+    assert f("Bangalore, KA, IN") == "IN"
+    assert f("Boise, ID") == "US"
+    assert f("Jakarta, ID") == "ID"
+    # Georgia is a country as well as a state, so the name alone can't
+    # imply the US.
+    assert f("Tbilisi, Georgia") == ""
+
+
+def test_country_iso_admin_codes_do_not_over_match():
+    from pipeline.publisher import _country_iso_from_location as f
+
+    # Not a state, not a country.
+    assert f("Remote, XX") == ""
+    assert f("Lausanne, Vaud") == ""
+    # A component must match whole — "Bear" (DE) must not fire here.
+    assert f("Bearsden") == ""
 
 
 def test_title_core_strips_trailing_parenthesised_tag():

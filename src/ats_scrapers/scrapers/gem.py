@@ -284,7 +284,7 @@ def _apply_detail_to_job(job: Job, detail: dict[str, Any]) -> None:
         ts = detail.get(key)
         if isinstance(ts, (int, float)) and ts > 0:
             try:
-                job.posted_at = datetime.fromtimestamp(ts)
+                job.posted_at = datetime.fromtimestamp(ts, tz=UTC)
                 break
             except (OSError, ValueError):
                 continue

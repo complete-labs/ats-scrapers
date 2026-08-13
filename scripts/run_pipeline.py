@@ -31,9 +31,12 @@ import sys
 import tempfile
 import time
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
+
+from pydantic import ValidationError
 
 from ats_scrapers.exceptions import CompanyNotFoundError
 from ats_scrapers.models import Job
@@ -980,7 +983,11 @@ def _pipeline_lock(ats: str):
 # format we no longer know how to decode (e.g. legacy ``description
 # TEXT`` rows that would silently come back as ``str`` through the BLOB
 # read path and crash zstd decompression).
-_CACHE_SCHEMA_VERSION = 2
+_CACHE_SCHEMA_VERSION = 3
+# Versions that can be upgraded in place rather than rebuilt. v2 -> v3 only
+# appends a nullable ``metadata`` column, so the existing ~700k Workday
+# descriptions stay valid and keep their encoding.
+_CACHE_MIGRATABLE_VERSIONS = frozenset({2})
 
 
 class DescriptionCache:
@@ -1044,7 +1051,8 @@ class DescriptionCache:
             # changes incompatibly so an older persistent file fails loudly
             # at open instead of silently mixing schemas. Version 1 is the
             # original ``description TEXT`` layout; version 2 introduced
-            # ``description BLOB`` to carry optionally-zstd-compressed bytes.
+            # ``description BLOB`` to carry optionally-zstd-compressed bytes;
+            # version 3 added the nullable ``metadata`` column.
             current_user_version = self.conn.execute(
                 "PRAGMA user_version"
             ).fetchone()[0]
@@ -1057,6 +1065,11 @@ class DescriptionCache:
                 existing_rows = self.conn.execute(
                     "SELECT COUNT(*) FROM descriptions"
                 ).fetchone()[0]
+            if (
+                existing_rows > 0
+                and current_user_version in _CACHE_MIGRATABLE_VERSIONS
+            ):
+                current_user_version = self._migrate_to_current(existing_table)
             if existing_rows > 0 and current_user_version != _CACHE_SCHEMA_VERSION:
                 # Bail loudly rather than try to interpret an unknown layout
                 # — silently returning TEXT bytes through the BLOB path
@@ -1080,6 +1093,7 @@ class DescriptionCache:
                     kind TEXT NOT NULL,
                     cache_key TEXT NOT NULL,
                     description BLOB NOT NULL,
+                    metadata BLOB,
                     PRIMARY KEY (kind, cache_key)
                 )
                 """
@@ -1096,6 +1110,26 @@ class DescriptionCache:
             if self._owns_tempfile:
                 self.path.unlink(missing_ok=True)
             raise
+
+    def _migrate_to_current(self, existing_table: object) -> int:
+        """Upgrade an older persistent cache in place.
+
+        v2 -> v3 only appends the nullable ``metadata`` column, so the
+        cached descriptions stay exactly as they were — rebuilding a
+        700k-entry Workday cache from scratch would cost a full re-crawl
+        of the detail endpoint.
+        """
+        if existing_table is None:
+            return _CACHE_SCHEMA_VERSION
+        columns = {
+            row[1]
+            for row in self.conn.execute("PRAGMA table_info(descriptions)")
+        }
+        if "metadata" not in columns:
+            self.conn.execute("ALTER TABLE descriptions ADD COLUMN metadata BLOB")
+        self.conn.execute(f"PRAGMA user_version = {_CACHE_SCHEMA_VERSION}")
+        self.conn.commit()
+        return _CACHE_SCHEMA_VERSION
 
     def close(self) -> None:
         if self.conn is not None:
@@ -1116,7 +1150,7 @@ class DescriptionCache:
         if not path.exists():
             return
 
-        batch: list[tuple[str, str, bytes]] = []
+        batch: list[tuple[str, str, bytes, bytes | None]] = []
         try:
             with path.open(newline="") as fh:
                 for row in csv.DictReader(fh):
@@ -1125,7 +1159,7 @@ class DescriptionCache:
                         continue
                     blob = self._encode(description)
                     for key in _row_description_keys(row):
-                        batch.append((*key, blob))
+                        batch.append((*key, blob, None))
                     if len(batch) >= 2_000:
                         self._insert_many(batch)
                         batch.clear()
@@ -1138,6 +1172,18 @@ class DescriptionCache:
             "SELECT COUNT(*) FROM descriptions"
         ).fetchone()[0]
 
+    def _encode_metadata(self, metadata: dict[str, Any]) -> bytes:
+        return self._encode(json.dumps(metadata, default=str, ensure_ascii=False))
+
+    def _decode_metadata(self, blob: bytes | None) -> dict[str, Any]:
+        if not blob:
+            return {}
+        try:
+            decoded = json.loads(self._decode(blob))
+        except (ValueError, UnicodeDecodeError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+
     def _insert_many(self, rows: list[tuple[str, str, bytes]], *, replace: bool = False) -> int:
         """Bulk insert. ``replace=True`` overwrites existing rows
         (used by :meth:`set` so an updated description from a fresh
@@ -1146,33 +1192,60 @@ class DescriptionCache:
         :meth:`load_csv` wants when seeding from a CSV that may have
         the same URL listed multiple times.
         """
-        verb = "INSERT OR REPLACE" if replace else "INSERT OR IGNORE"
-        cur = self.conn.executemany(
-            f"""
-            {verb} INTO descriptions (kind, cache_key, description)
-            VALUES (?, ?, ?)
-            """,
-            rows,
-        )
+        if replace:
+            # Upsert rather than INSERT OR REPLACE: a plain replace would
+            # blank the metadata column whenever a caller writes back only
+            # a description.
+            statement = """
+            INSERT INTO descriptions (kind, cache_key, description, metadata)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(kind, cache_key) DO UPDATE SET
+                description = excluded.description,
+                metadata = COALESCE(excluded.metadata, descriptions.metadata)
+            """
+        else:
+            statement = """
+            INSERT OR IGNORE INTO descriptions
+                (kind, cache_key, description, metadata)
+            VALUES (?, ?, ?, ?)
+            """
+        cur = self.conn.executemany(statement, rows)
         self.conn.commit()
         return cur.rowcount
 
     def get(self, job: Job) -> str | None:
+        description, _ = self.get_with_metadata(job)
+        return description
+
+    def get_with_metadata(self, job: Job) -> tuple[str | None, dict[str, Any]]:
+        """Return the cached description and any detail metadata beside it.
+
+        Sources whose extra fields only exist on a per-job detail endpoint
+        (Workday's country, posted date and time type) cache them here so a
+        cache hit is as complete as a fresh fetch — otherwise those fields
+        would only ever be populated for newly-seen listings.
+        """
         for kind, key in _description_keys(job):
             row = self.conn.execute(
                 """
-                SELECT description FROM descriptions
+                SELECT description, metadata FROM descriptions
                 WHERE kind = ? AND cache_key = ?
                 """,
                 (kind, key),
             ).fetchone()
             if row:
-                return self._decode(row[0])
-        return None
+                return self._decode(row[0]), self._decode_metadata(row[1])
+        return None, {}
 
-    def set(self, job: Job, description: str) -> None:
+    def set(
+        self,
+        job: Job,
+        description: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         blob = self._encode(description)
-        rows = [(*key, blob) for key in _description_keys(job)]
+        meta_blob = self._encode_metadata(metadata) if metadata else None
+        rows = [(*key, blob, meta_blob) for key in _description_keys(job)]
         if not rows:
             return
         # Single-row updates from _ensure_description must replace any
@@ -1186,7 +1259,7 @@ class DescriptionCache:
             "SELECT COUNT(*) FROM descriptions WHERE (kind, cache_key) IN ("
             + ",".join("(?,?)" for _ in rows)
             + ")",
-            [v for kind, key, _ in rows for v in (kind, key)],
+            [v for kind, key, *_ in rows for v in (kind, key)],
         ).fetchone()[0]
         new_keys = len(rows) - existing
         self._insert_many(rows, replace=True)
@@ -1292,8 +1365,14 @@ def _descriptions_look_capped(path: Path, max_len: int) -> bool:
     return found_description
 
 
-def _cached_description(job: Job, cache: DescriptionCache) -> str | None:
-    return cache.get(job)
+def _cached_description(
+    job: Job, cache: DescriptionCache
+) -> tuple[str | None, dict[str, Any]]:
+    # Tolerate cache objects that predate the metadata column.
+    reader = getattr(cache, "get_with_metadata", None)
+    if reader is None:
+        return cache.get(job), {}
+    return reader(job)
 
 
 async def _ensure_description(
@@ -1301,8 +1380,23 @@ async def _ensure_description(
     job: Job,
     cache: DescriptionCache,
 ) -> str:
-    cached = _cached_description(job, cache)
+    cached, cached_fields = _cached_description(job, cache)
+    _apply_detail_fields(job, cached_fields)
     fresh = job.description
+    if cached and not cached_fields and _should_backfill_detail_fields(scraper):
+        # Entries cached before the detail fields existed carry a body but
+        # no country/date. Re-fetching is the only way to fill them, so it
+        # is opt-in: on a large cache it means one more pass over the whole
+        # board, after which the fields are cached like everything else.
+        try:
+            _, detail_fields = await asyncio.to_thread(
+                scraper.get_description_and_fields, job
+            )
+        except Exception:
+            detail_fields = {}
+        if detail_fields:
+            _apply_detail_fields(job, detail_fields)
+            cache.set(job, cached, detail_fields)
     if cached:
         # Prefer the longer description. The cache is the previous run's
         # jobs.csv (or a persistent SQLite). When the scraper has already
@@ -1321,19 +1415,78 @@ async def _ensure_description(
         return "present"
     if fresh:
         return "present"
+    # ``get_description_and_fields`` is the richer hook; fall back to the
+    # plain one so scrapers (and test doubles) that only implement the
+    # original contract keep working.
+    fetch = getattr(scraper, "get_description_and_fields", None)
+    if fetch is None:
+        def fetch(target: Job) -> tuple[str | None, dict[str, Any]]:
+            return scraper.get_description(target), {}
+
     try:
-        description = await asyncio.to_thread(scraper.get_description, job)
+        description, detail_fields = await asyncio.to_thread(fetch, job)
     except Exception as exc:
         print(
             "  description fetch failed for "
             f"{job.url}: {type(exc).__name__}: {str(exc)[:200]}"
         )
         return "error"
+    _apply_detail_fields(job, detail_fields)
     if description:
         job.description = description[:25_000]
-        cache.set(job, job.description)
+        # Persist the detail fields beside the body so tomorrow's cache hit
+        # is as complete as today's fetch.
+        cache.set(job, job.description, detail_fields or None)
         return "fetched"
     return "missing"
+
+
+# Fields a detail fetch may contribute. Restricted to a known set so a
+# provider cannot write arbitrary attributes onto a Job through the cache.
+_CACHEABLE_DETAIL_FIELDS = frozenset(
+    {"country_iso", "region", "posted_at", "employment_type", "is_remote", "lat", "lon"}
+)
+
+
+def _should_backfill_detail_fields(scraper: BaseScraper) -> bool:
+    """Whether to re-fetch cache entries that predate the detail fields.
+
+    Off by default: for Workday this is a full extra pass over the board,
+    so the operator opts in once and the results are cached from then on.
+    """
+    if not getattr(scraper, "provides_detail_fields", False):
+        return False
+    flag = os.environ.get("ATS_SCRAPERS_DETAIL_FIELD_BACKFILL", "").strip().lower()
+    return flag in {"1", "true", "yes", "on"}
+
+
+#: Detail fields that are not JSON-native and need rebuilding on the way
+#: back out of the cache.
+_DETAIL_FIELD_DECODERS: dict[str, Any] = {
+    "posted_at": lambda v: (
+        v if isinstance(v, datetime) else datetime.fromisoformat(str(v))
+    ),
+}
+
+
+def _apply_detail_fields(job: Job, fields: dict[str, Any]) -> None:
+    """Fill blank ``job`` attributes from a detail fetch or cache hit.
+
+    Only unset fields are touched: a value the listing endpoint already
+    supplied is more current than one recovered from cache. ``Job`` does
+    not validate on assignment, so values that JSON cannot represent
+    natively are rebuilt here rather than written through as strings.
+    """
+    for name, value in (fields or {}).items():
+        if name not in _CACHEABLE_DETAIL_FIELDS or value is None:
+            continue
+        if getattr(job, name, None) is not None:
+            continue
+        decoder = _DETAIL_FIELD_DECODERS.get(name)
+        try:
+            setattr(job, name, decoder(value) if decoder else value)
+        except (ValidationError, ValueError, TypeError):
+            continue
 
 
 def _job_to_row(job: Job) -> dict[str, Any]:
@@ -1545,7 +1698,10 @@ async def run(ats: str, concurrency: int, max_tenants: int | None, timeout: floa
 
                 try:
                     async for job in scraper.fetch_stream():
-                        cached = _cached_description(job, description_cache)
+                        cached, cached_fields = _cached_description(
+                            job, description_cache
+                        )
+                        _apply_detail_fields(job, cached_fields)
                         if cached:
                             job.description = cached
                             write_streamed_job(job)
@@ -1616,7 +1772,8 @@ async def run(ats: str, concurrency: int, max_tenants: int | None, timeout: floa
                             continue
                         seen_keys.add(key)
                         if scraper is not None and not cfg.get("skip_description_enrichment"):
-                            if _cached_description(job, description_cache) or job.description:
+                            cached_body, _ = _cached_description(job, description_cache)
+                            if cached_body or job.description:
                                 desc_status = await _ensure_description(
                                     scraper, job, description_cache
                                 )

@@ -30,6 +30,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, ClassVar
 from urllib.parse import urlparse
 
+from ats_scrapers.enrichment.geo import resolve_country
 from ats_scrapers.exceptions import ScraperError
 from ats_scrapers.models import ATSType, Job
 from ats_scrapers.scrapers.base import BaseScraper, ScraperRegistry
@@ -48,13 +49,16 @@ DETAIL_CONCURRENCY = 8
 _TAG_RE = re.compile(r"<[^>]+>")
 
 # Oracle's ``WorkplaceTypeCode`` is a stable enum string — map to the
-# canonical remote flag. ``ORA_HYBRID`` stays None (neither purely
-# remote nor onsite).
+# canonical remote flag. Hybrid is ``False``: the role requires office
+# attendance, so it cannot be performed remotely. It is also the second
+# most common value on Oracle boards, so leaving it unset stranded a
+# third of the postings that state a workplace type at all.
 _REMOTE_BY_CODE = {
     "ORA_REMOTE": True,
     "ORA_FULL_TIME_REMOTE": True,
     "ORA_ON_SITE": False,
     "ORA_ONSITE": False,
+    "ORA_HYBRID": False,
 }
 
 # WorkerType / JobType / JobSchedule labels → canonical employment-type
@@ -341,6 +345,10 @@ class OracleScraper(BaseScraper):
             if v not in (None, "", [], False):
                 raw[k] = v
 
+        # ``PrimaryLocationCountry`` is already an ISO 3166-1 alpha-2 code
+        # ("AU", "US") on essentially every row — no text parsing needed.
+        country_iso, region = resolve_country(item.get("PrimaryLocationCountry"))
+
         return Job(
             url=item.get("ExternalURL")
             or f"{base}/?keyword=&mode=jobs&lang=en&site_number={site}#{source_id}",
@@ -349,6 +357,8 @@ class OracleScraper(BaseScraper):
             ats_type=ATSType.ORACLE,
             ats_id=ats_id,
             location=item.get("PrimaryLocation"),
+            country_iso=country_iso,
+            region=region,
             is_remote=is_remote,
             department=department,
             team=team,
