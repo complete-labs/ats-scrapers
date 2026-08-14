@@ -24,8 +24,9 @@ from __future__ import annotations
 import html as html_mod
 import re
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, cast
 
+from ats_scrapers.enrichment.derived import parse_salary_block
 from ats_scrapers.models import ATSType, Job, SalaryPeriod
 from ats_scrapers.scrapers.base import BaseScraper, ScraperRegistry
 
@@ -81,6 +82,22 @@ class GreenhouseScraper(BaseScraper):
             payload = await fetch.get_json(url)
         return [self._parse_job(item) for item in payload.get("jobs", [])]
 
+    def _company_for(self, item: dict[str, Any]) -> str:
+        """Employer name, preferring the curated one over the board's.
+
+        Greenhouse puts the employer's own display name on every job
+        (``company_name``), which beats the slug — ``anthropic`` and
+        ``Anthropic`` are otherwise two employers to any consumer that
+        groups on the string. A configured name still wins so the
+        inventory stays the single spelling across every ATS.
+        """
+        if self.company_name:
+            return self.company_name
+        board_name = item.get("company_name")
+        if isinstance(board_name, str) and board_name.strip():
+            return board_name.strip()
+        return self.company_slug
+
     def _parse_job(self, item: dict[str, Any]) -> Job:
         offices = item.get("offices") or []
         departments = item.get("departments") or []
@@ -126,12 +143,26 @@ class GreenhouseScraper(BaseScraper):
             ):
                 requisition_id = req_str
 
+        # ``pay_input_ranges`` (unlocked by ``pay_transparency=true``) is
+        # the employer's own structured range and is trusted first. Plenty
+        # of employers never touch the pay widget and write the same
+        # disclosure as prose in the body instead, so when the structured
+        # field yields nothing we recover the range from the description.
         salary = _parse_pay_ranges(item.get("pay_input_ranges"))
+        if salary.minimum is None and salary.maximum is None:
+            block = parse_salary_block(description)
+            if block is not None:
+                salary = _PayRange(
+                    currency=block.currency,
+                    period=cast("SalaryPeriod", block.period),
+                    minimum=block.min_amount,
+                    maximum=block.max_amount,
+                )
 
         return Job(
             url=item["absolute_url"],
             title=item["title"],
-            company=self.company_slug,
+            company=self._company_for(item),
             ats_type=ATSType.GREENHOUSE,
             ats_id=str(item["id"]),
             location=(item.get("location") or {}).get("name"),

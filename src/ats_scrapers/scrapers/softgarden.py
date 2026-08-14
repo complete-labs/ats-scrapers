@@ -142,6 +142,7 @@ class SoftgardenScraper(BaseScraper):
         self,
         company_slug: str,
         *,
+        company_name: str | None = None,
         timeout: float = 30.0,
         include_descriptions: bool = True,
         proxy: str | None = None,
@@ -151,6 +152,7 @@ class SoftgardenScraper(BaseScraper):
             timeout=timeout,
             include_descriptions=include_descriptions,
             proxy=proxy,
+            company_name=company_name,
         )
         self.company_slug = _normalize_tenant(company_slug)
         self.feed_url = FEED_URL.format(tenant=self.company_slug)
@@ -210,7 +212,10 @@ class SoftgardenScraper(BaseScraper):
             )
         job_id = _job_id(identifier.get("value"))
         title = _required_string(item, "title")
-        company = _required_string(organization, "name")
+        # The feed's ``hiringOrganization.name`` is still required — it is
+        # an identity-metadata check — but a curated name is published in
+        # its place so the employer reads the same across every ATS.
+        company = self.company_name or _required_string(organization, "name")
         job_url = _trusted_job_url(item.get("url"), job_id)
         description = _string(item.get("description"))
         location, country_iso = _locations(item.get("jobLocation"))

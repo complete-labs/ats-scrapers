@@ -163,7 +163,7 @@ class LeverScraper(BaseScraper):
         return Job(
             url=item["hostedUrl"],
             title=item["text"],
-            company=self.company_slug,
+            company=self.display_company,
             ats_type=ATSType.LEVER,
             ats_id=item["id"],
             location=categories.get("location"),

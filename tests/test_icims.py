@@ -308,12 +308,13 @@ def test_distinct_locations_no_longer_collapse(httpx_mock) -> None:
 
 
 def test_extracts_posted_at(httpx_mock) -> None:
-    from datetime import datetime
+    from datetime import UTC, datetime
     card = _job_card("100", "Engineer", posted_at="5/6/2026 10:23 AM")
     httpx_mock.add_response(url=_page_url("acme", 0), text=_page([card]))
     httpx_mock.add_response(url=_page_url("acme", 1), text=_page([]))
     jobs = iCIMSScraper("acme").fetch()
-    assert jobs[0].posted_at == datetime(2026, 5, 6, 10, 23)
+    # iCIMS prints a bare wall-clock time; the schema reads it as UTC.
+    assert jobs[0].posted_at == datetime(2026, 5, 6, 10, 23, tzinfo=UTC)
 
 
 def test_extracts_description(httpx_mock) -> None:

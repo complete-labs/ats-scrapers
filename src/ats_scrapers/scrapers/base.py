@@ -72,11 +72,28 @@ class BaseScraper(ABC):
         timeout: float = 30.0,
         include_descriptions: bool = True,
         proxy: str | None = None,
+        company_name: str | None = None,
     ) -> None:
         self.company_slug = company_slug
+        self.company_name = (company_name or "").strip() or None
         self.timeout = timeout
         self.include_descriptions = include_descriptions
         self.proxy = proxy
+
+    @property
+    def display_company(self) -> str:
+        """Employer name to publish on ``Job.company``.
+
+        A board slug is a routing token, not a name: Greenhouse's
+        ``anthropic`` and Welcome to the Jungle's ``Anthropic`` are the
+        same employer, but publishing both verbatim splits them into two
+        employer facets that no downstream aggregate can reconcile.
+        ``company_name`` carries the curated display name from
+        ``ats-companies/{ats}.csv`` so every source agrees on one
+        spelling; the slug remains the fallback for ad-hoc scrapes of
+        tenants that aren't in the inventory.
+        """
+        return self.company_name or self.company_slug
 
     @abstractmethod
     async def afetch(self) -> list[Job]:

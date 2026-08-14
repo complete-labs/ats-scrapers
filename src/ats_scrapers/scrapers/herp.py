@@ -118,6 +118,7 @@ class HerpScraper(BaseScraper):
         self,
         company_slug: str,
         *,
+        company_name: str | None = None,
         timeout: float = 30.0,
         include_descriptions: bool = True,
         proxy: str | None = None,
@@ -127,6 +128,7 @@ class HerpScraper(BaseScraper):
             timeout=timeout,
             include_descriptions=include_descriptions,
             proxy=proxy,
+            company_name=company_name,
         )
         self.company_slug = require_host_label(company_slug, provider="HerpScraper")
 
@@ -156,8 +158,10 @@ class HerpScraper(BaseScraper):
         if soup.select_one(".requisition-list") is None:
             raise ScraperError(f"HERP ({self.company_slug}) returned an unrecognized careers page")
 
+        # A curated name outranks the board's own, so the employer reads
+        # the same here as on every other ATS it posts to.
         company_meta = soup.select_one('meta[property="og:site_name"]')
-        company = (
+        company = self.company_name or (
             company_meta.get("content", "").strip() if company_meta is not None else ""
         ) or self.company_slug
 

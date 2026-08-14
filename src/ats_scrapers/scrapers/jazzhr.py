@@ -130,12 +130,14 @@ class JazzHRScraper(BaseScraper):
         include_descriptions: bool = True,
         proxy: str | None = None,
         client_kind: ClientKind = "auto",
+        company_name: str | None = None,
     ) -> None:
         super().__init__(
             company_slug,
             timeout=timeout,
             include_descriptions=include_descriptions,
             proxy=proxy,
+            company_name=company_name,
         )
         self.company_slug = require_host_label(company_slug, provider="JazzHRScraper")
         self.client_kind: ClientKind = client_kind
@@ -286,7 +288,7 @@ class JazzHRScraper(BaseScraper):
                 Job(
                     url=JOB_URL_TEMPLATE.format(slug=self.company_slug, id=ats_id),
                     title=title,
-                    company=self.company_slug,
+                    company=self.display_company,
                     ats_type=ATSType.JAZZHR,
                     ats_id=ats_id,
                     location=location,

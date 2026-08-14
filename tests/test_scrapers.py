@@ -132,6 +132,63 @@ def test_base_scraper_custom_timeout() -> None:
     assert scraper.timeout == 5.0
 
 
+def test_display_company_defaults_to_slug() -> None:
+    assert GreenhouseScraper("acme").display_company == "acme"
+
+
+def test_display_company_prefers_configured_name() -> None:
+    scraper = GreenhouseScraper("acme", company_name="Acme Corp")
+    assert scraper.display_company == "Acme Corp"
+
+
+@pytest.mark.parametrize("blank", ["", "   ", None])
+def test_display_company_ignores_blank_names(blank) -> None:
+    scraper = GreenhouseScraper("acme", company_name=blank)
+    assert scraper.company_name is None
+    assert scraper.display_company == "acme"
+
+
+@pytest.mark.parametrize(
+    "ats",
+    [
+        ATSType.GREENHOUSE, ATSType.LEVER, ATSType.ASHBY, ATSType.WORKABLE,
+        ATSType.TEAMTAILOR, ATSType.SMARTRECRUITERS, ATSType.RIPPLING,
+        ATSType.PINPOINT, ATSType.JOIN_COM, ATSType.JAZZHR, ATSType.GEM,
+        ATSType.BAMBOOHR,
+    ],
+)
+def test_slug_only_scrapers_accept_a_company_name(ats: ATSType) -> None:
+    """These once published their board slug as the employer name.
+
+    A slug is a routing token: Greenhouse's ``anthropic`` and Welcome
+    to the Jungle's ``Anthropic`` are one employer that split into two
+    facets downstream. Each must now take the curated display name.
+    """
+    scraper = get_scraper(ats, "acme", company_name="Acme Corp")
+    assert scraper.display_company == "Acme Corp"
+
+
+@pytest.mark.parametrize(
+    ("ats", "slug"),
+    [
+        (ATSType.ORACLE, "https://careers.acme.com"),
+        (ATSType.PHENOM, "https://jobs.acme.com"),
+        (ATSType.PERSONIO, "https://acme.jobs.personio.de"),
+    ],
+)
+def test_hostname_fallback_yields_to_the_curated_name(
+    ats: ATSType, slug: str
+) -> None:
+    """These three derive the employer from the careers hostname.
+
+    Left alone that publishes ``jobs.acme.com`` as the employer name.
+    Every tenant row for all three carries a curated ``name``, so the
+    hostname is only ever a last resort.
+    """
+    scraper = get_scraper(ats, slug, company_name="Acme Corp")
+    assert scraper.company_name == "Acme Corp"
+
+
 # --- Greenhouse --------------------------------------------------------------
 
 # Derived from the scraper's own template rather than hardcoded, so a
@@ -333,6 +390,73 @@ def test_ashby_parses_jobs_with_compensation(httpx_mock) -> None:
     designer = jobs[1]
     assert designer.salary_currency is None
     assert str(designer.url).endswith("/apply")
+
+
+def _ashby_comp_payload(*component_types: str) -> dict:
+    """One Ashby job whose tier lists the given component types.
+
+    Mirrors the live shape: only Salary carries values; the rest are
+    disclosure flags with null amounts.
+    """
+    components = []
+    for kind in component_types:
+        if kind == "Salary":
+            components.append({
+                "compensationType": "Salary", "interval": "1 YEAR",
+                "minValue": 200000, "maxValue": 300000, "currencyCode": "USD",
+            })
+        else:
+            components.append({
+                "compensationType": kind, "interval": "1 YEAR",
+                "minValue": None, "maxValue": None, "currencyCode": "USD",
+                "summary": f"Offers {kind}",
+            })
+    return {
+        "jobs": [{
+            "id": "x", "title": "X", "location": "Remote",
+            "jobUrl": "https://jobs.ashbyhq.com/x/x", "publishedAt": None,
+            "compensation": {"compensationTiers": [{"components": components}]},
+        }]
+    }
+
+
+@pytest.mark.parametrize(
+    ("component", "expected_field"),
+    [
+        ("EquityPercentage", "offers_equity"),
+        ("EquityCashValue", "offers_equity"),
+        ("Bonus", "offers_bonus"),
+        ("Commission", "offers_commission"),
+    ],
+)
+def test_ashby_surfaces_non_salary_package_components(
+    httpx_mock, component: str, expected_field: str
+) -> None:
+    """Audit finding 12: equity and total comp weren't represented.
+
+    These components were parsed and then discarded — only ``Salary``
+    reached the schema, leaving the rest reachable solely by digging
+    through ``raw``.
+    """
+    httpx_mock.add_response(
+        url="https://api.ashbyhq.com/posting-api/job-board/ramp?includeCompensation=true",
+        json=_ashby_comp_payload("Salary", component),
+    )
+    job = AshbyScraper("ramp").fetch()[0]
+    assert getattr(job, expected_field) is True
+    assert job.salary_min == 200000
+
+
+def test_ashby_leaves_absent_components_unknown(httpx_mock) -> None:
+    """Not mentioning equity is not the same as excluding it."""
+    httpx_mock.add_response(
+        url="https://api.ashbyhq.com/posting-api/job-board/ramp?includeCompensation=true",
+        json=_ashby_comp_payload("Salary"),
+    )
+    job = AshbyScraper("ramp").fetch()[0]
+    assert job.offers_equity is None
+    assert job.offers_bonus is None
+    assert job.offers_commission is None
 
 
 def test_ashby_404(httpx_mock) -> None:

@@ -146,7 +146,7 @@ class RipplingScraper(BaseScraper):
             or item.get("hostedUrl")
             or f"https://ats.rippling.com/{self.company_slug}/jobs/{ats_id}",
             title=item.get("name") or item.get("title") or "Untitled",
-            company=self.company_slug,
+            company=self.display_company,
             ats_type=ATSType.RIPPLING,
             ats_id=ats_id,
             location=_extract_location(item),

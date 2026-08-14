@@ -5,7 +5,7 @@ Field renames here are breaking changes — these tests pin the contract.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from pydantic import ValidationError
@@ -160,14 +160,34 @@ def test_job_rejects_invalid_url() -> None:
 
 
 def test_job_posted_at_accepts_datetime() -> None:
-    when = datetime(2026, 1, 15, 12, 0, 0)
+    when = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
     job = _minimal_job(posted_at=when)
     assert job.posted_at == when
 
 
 def test_job_posted_at_accepts_iso_string() -> None:
-    job = _minimal_job(posted_at="2026-01-15T12:00:00")
-    assert job.posted_at == datetime(2026, 1, 15, 12, 0, 0)
+    job = _minimal_job(posted_at="2026-01-15T12:00:00Z")
+    assert job.posted_at == datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
+
+
+def test_job_reads_naive_timestamps_as_utc() -> None:
+    """The schema promises UTC, so a naive value is taken at its word.
+
+    Scrapers that call ``datetime.fromtimestamp`` without a timezone
+    otherwise encode the scrape host's local clock, which made the same
+    posting's date depend on where the pipeline ran.
+    """
+    job = _minimal_job(
+        posted_at=datetime(2026, 1, 15, 12, 0, 0),
+        fetched_at=datetime(2026, 1, 16, 9, 30, 0),
+    )
+    assert job.posted_at == datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
+    assert job.fetched_at == datetime(2026, 1, 16, 9, 30, 0, tzinfo=UTC)
+
+
+def test_job_preserves_an_explicit_timezone() -> None:
+    aware = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone(timedelta(hours=5)))
+    assert _minimal_job(posted_at=aware).posted_at == aware
 
 
 def test_job_accepts_ats_type_via_alias() -> None:

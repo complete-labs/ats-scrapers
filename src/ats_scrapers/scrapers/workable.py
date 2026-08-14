@@ -174,7 +174,7 @@ class WorkableScraper(BaseScraper):
         return Job(
             url=url,
             title=item["title"],
-            company=self.company_slug,
+            company=self.display_company,
             ats_type=ATSType.WORKABLE,
             ats_id=item.get("shortcode") or item.get("code") or str(item.get("id", "")),
             location=_extract_location(item),

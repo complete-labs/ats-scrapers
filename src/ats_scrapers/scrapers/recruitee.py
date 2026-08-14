@@ -48,12 +48,14 @@ class RecruiteeScraper(BaseScraper):
         timeout: float = 30.0,
         include_descriptions: bool = True,
         proxy: str | None = None,
+        company_name: str | None = None,
     ) -> None:
         super().__init__(
             company_slug,
             timeout=timeout,
             include_descriptions=include_descriptions,
             proxy=proxy,
+            company_name=company_name,
         )
         slug = company_slug.strip()
         if slug.startswith(("http://", "https://")):
@@ -105,7 +107,11 @@ class RecruiteeScraper(BaseScraper):
         return Job(
             url=url,
             title=offer.get("title") or offer.get("position") or "Untitled",
-            company=offer.get("company_name") or self.company_slug,
+            company=(
+                self.company_name
+                or offer.get("company_name")
+                or self.company_slug
+            ),
             ats_type=ATSType.RECRUITEE,
             ats_id=str(offer.get("id") or offer.get("slug") or ""),
             location=location,

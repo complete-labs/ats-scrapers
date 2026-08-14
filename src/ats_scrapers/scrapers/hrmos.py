@@ -60,6 +60,7 @@ class HrmosScraper(BaseScraper):
         self,
         company_slug: str,
         *,
+        company_name: str | None = None,
         timeout: float = 30.0,
         include_descriptions: bool = True,
         proxy: str | None = None,
@@ -69,6 +70,7 @@ class HrmosScraper(BaseScraper):
             timeout=timeout,
             include_descriptions=include_descriptions,
             proxy=proxy,
+            company_name=company_name,
         )
         self.company_slug = require_host_label(
             company_slug,
@@ -124,8 +126,11 @@ class HrmosScraper(BaseScraper):
         displayed = int(count_match.group(2).replace(",", ""))
         company_options = _company_options(soup)
 
+        # A curated name replaces only the page-wide default. Cards that
+        # name a subsidiary from ``company_options`` keep it: the tenant
+        # hosts several employers and the card is the more specific one.
         jobs = [
-            self._parse_card(card, company, company_options)
+            self._parse_card(card, self.company_name or company, company_options)
             for card in soup.select(".pg-list-cassette")
         ]
         if len(jobs) != displayed:

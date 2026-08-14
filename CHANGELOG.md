@@ -100,6 +100,29 @@ almost entirely cache hits means almost never.
   code for the United Kingdom (`GB` is), so postings written
   "London, UK" resolved to no country at all.
 
+### Changed — the combined dataset prefers links you can open
+
+A posting that exists both on Welcome to the Jungle and on the
+employer's own ATS now resolves to the employer's row in
+`all.{csv,parquet}`. WTTJ hides every posting behind a sign-in wall,
+and it already ranked below the direct-employer sources — but it
+reformats titles (`"Title, Qualifier"` → `"Title (Qualifier)"`) and
+locations, so the dedup passes never paired the two and both rows
+shipped. Two passes now match them on company plus a punctuation-free
+title, with no location or country agreement required.
+
+Only gated rows are dropped, and only against the employer's own
+board: WTTJ still outranks the public aggregators. Per-source slices
+(`<ats>/jobs.csv`) stay raw as before.
+
+### Added — `salary_source`
+
+New nullable column in `all.{csv,parquet}`. WTTJ is one of the few
+sources that publishes pay, so a dropped row donates its salary block
+to the employer row that replaced it when that row prices nothing
+itself; `salary_source` names where the figure came from. Rows that
+published their own salary keep it and leave the column null.
+
 ## [0.2.0] — 2026-07-23
 
 ### Added — company discovery without ATS knowledge

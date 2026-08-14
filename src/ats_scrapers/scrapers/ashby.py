@@ -87,6 +87,7 @@ class AshbyScraper(BaseScraper):
             or comp.get("scrapeableCompensationSalarySummary")
         )
         salary = _parse_comp(comp)
+        package = _parse_package(comp)
 
         emp_type = (item.get("employmentType") or "").upper()
         employment_type = _EMPLOYMENT_TYPE_MAP.get(emp_type)
@@ -125,7 +126,7 @@ class AshbyScraper(BaseScraper):
         return Job(
             url=job_url,
             title=item["title"],
-            company=self.company_slug,
+            company=self.display_company,
             ats_type=ATSType.ASHBY,
             ats_id=item["id"],
             location=place.display,
@@ -142,6 +143,7 @@ class AshbyScraper(BaseScraper):
             salary_summary=summary,
             salary_min=salary.minimum,
             salary_max=salary.maximum,
+            **package,
             posted_at=_parse_iso(item.get("publishedAt")),
             fetched_at=datetime.now(UTC),
             raw=raw or None,
@@ -350,6 +352,35 @@ def _clean_description(value: object) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None
     return value[:_MAX_DESCRIPTION_CHARS]
+
+
+def _parse_package(comp: dict[str, Any] | None) -> dict[str, bool | None]:
+    """Which non-salary components the posting says it includes.
+
+    ``_parse_comp`` deliberately reads only the Salary component, so
+    everything else Ashby discloses — equity, bonus, commission — was
+    reachable solely by digging through ``raw``. These are booleans, not
+    amounts: the equity and bonus components carry null values without
+    exception, and their summary is the bare string "Offers Equity".
+    Absence is not a denial, so a missing component stays ``None``.
+    """
+    flags: dict[str, bool | None] = {
+        "offers_equity": None,
+        "offers_bonus": None,
+        "offers_commission": None,
+    }
+    if not comp:
+        return flags
+    for tier in comp.get("compensationTiers") or []:
+        for component in tier.get("components") or []:
+            kind = str(component.get("compensationType") or "")
+            if kind.startswith("Equity"):
+                flags["offers_equity"] = True
+            elif kind == "Bonus":
+                flags["offers_bonus"] = True
+            elif kind == "Commission":
+                flags["offers_commission"] = True
+    return flags
 
 
 def _parse_iso(value: str | None) -> datetime | None:

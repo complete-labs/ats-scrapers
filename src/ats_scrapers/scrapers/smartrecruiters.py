@@ -201,7 +201,7 @@ class SmartRecruitersScraper(BaseScraper):
         return Job(
             url=f"https://jobs.smartrecruiters.com/{self.company_slug}/{item['id']}",
             title=item["name"],
-            company=self.company_slug,
+            company=self.display_company,
             ats_type=ATSType.SMARTRECRUITERS,
             ats_id=item["id"],
             location=loc_str,

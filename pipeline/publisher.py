@@ -32,7 +32,11 @@ DataFrame is ever materialized.
            thin keys frame: a single ``sort + filter`` pass per stage
            with ``pl.col(...).first().over(group)`` instead of
            Python-set bookkeeping. The keys frame is the only memory
-           peak in this pass.
+           peak in this pass. Its last two stages demote the gated
+           sources (:data:`GATED_LINK_SOURCES`) against the employer's
+           own board, so the published link is one a signed-out
+           reader can open; the gated row's salary is carried onto
+           the row that replaced it.
 
   Pass 3 — global ``all.parquet`` is built by lazy-scanning each
            per-ATS temp CSV, ``semi``-joining against its survivor
@@ -44,6 +48,7 @@ DataFrame is ever materialized.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
 import os
@@ -51,7 +56,7 @@ import re
 import tempfile
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -59,6 +64,8 @@ import polars as pl
 
 from ats_scrapers._version import __version__
 from ats_scrapers.enrichment import infer_is_remote, parse_salary_range
+from ats_scrapers.enrichment.derived import infer_seniority, parse_salary_block
+from ats_scrapers.enrichment.uslocation import looks_us
 from ats_scrapers.exceptions import StorageError
 from ats_scrapers.models import ATSType
 
@@ -71,6 +78,11 @@ try:
     from ats_scrapers.enrichment.derived import REMOTE_KEYWORDS as _REMOTE_KEYWORDS
 except ImportError:
     _REMOTE_KEYWORDS = ()
+
+try:
+    from ats_scrapers.enrichment.derived import SENIORITY_RULES as _SENIORITY_RULES
+except ImportError:
+    _SENIORITY_RULES = ()
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -181,6 +193,7 @@ class DatasetPublisher:
         with ExitStack() as stack:
             per_ats_csv_paths: dict[str, Path] = {}
             per_ats_entries: dict[ATSType, dict[str, object]] = {}
+            quarantine_csv_paths: list[Path] = []
             schema_union: list[str] = []
             seen_cols: set[str] = set()
 
@@ -224,6 +237,17 @@ class DatasetPublisher:
                         seen_cols.add(col)
                         schema_union.append(col)
 
+                # Rows failing a quality gate leave the dataset here, so
+                # neither the per-ATS slice nor ``all`` can carry them.
+                lf, rejected = _partition_quarantine(
+                    lf, schema_names, now=started
+                )
+                if rejected is not None:
+                    reject_path = stack.enter_context(_temp_file(".csv"))
+                    rejected.sink_csv(reject_path)
+                    if _csv_has_rows(reject_path):
+                        quarantine_csv_paths.append(reject_path)
+
                 csv_path = stack.enter_context(_temp_file(".csv"))
                 # ``sink_csv`` runs the lazy chain through polars'
                 # streaming engine — the per-ATS slice is never
@@ -247,7 +271,7 @@ class DatasetPublisher:
             # DataFrames during Pass 1. This avoids the cumulative
             # ~MB-per-ATS resident growth and lets polars' optimizer
             # decide when to materialize.
-            survivors, n_raw, n_kept = _dedup_from_per_ats_csvs(
+            outcome, n_raw, n_kept = _dedup_from_per_ats_csvs(
                 per_ats_csv_paths
             )
             logger.info(
@@ -257,20 +281,42 @@ class DatasetPublisher:
                 n_raw - n_kept,
             )
 
+            # ``salary_source`` only exists on rows that inherited pay
+            # from a dropped gated posting, so it isn't in any per-ATS
+            # slice's schema — add it to the union by hand or the
+            # manifest would under-report the ``all`` columns.
+            if any(
+                not donation.is_empty() for donation in outcome.donations.values()
+            ) and SALARY_SOURCE_COLUMN not in seen_cols:
+                seen_cols.add(SALARY_SOURCE_COLUMN)
+                schema_union.append(SALARY_SOURCE_COLUMN)
+
             # ---- Pass 3: stream all.parquet from the per-ATS temp CSVs ------
             all_entry = self._stream_write_all_polars(
                 per_ats_csv_paths=per_ats_csv_paths,
-                survivors=survivors,
+                survivors=outcome.survivors,
+                donations=outcome.donations,
                 schema_union=schema_union,
                 rows_total=n_kept,
+                observed_at=started,
             )
             files_uploaded.extend(_collect_uploaded_keys(all_entry))
+
+            quarantine_entry = self._upload_quarantine(quarantine_csv_paths)
+            if quarantine_entry is not None:
+                files_uploaded.extend(_collect_uploaded_keys(quarantine_entry))
+            n_quarantined = (
+                int(quarantine_entry["rows"])  # type: ignore[arg-type]
+                if quarantine_entry is not None
+                else 0
+            )
 
             manifest_key = self._patch_and_upload_manifest(
                 generated_at=started,
                 stats_factory=lambda existing: {
                     "total_jobs": n_kept,
                     "total_jobs_raw": n_raw,
+                    "total_jobs_quarantined": n_quarantined,
                     "total_companies": _sum_by_ats_companies_rows(existing),
                     "ats_count": len(per_ats_entries),
                     "schema_version": "2.0",
@@ -295,6 +341,44 @@ class DatasetPublisher:
                 ats_count=len(per_ats_entries),
                 duration_seconds=(ended - started).total_seconds(),
             )
+
+    def _upload_quarantine(
+        self, quarantine_csv_paths: list[Path]
+    ) -> dict[str, object] | None:
+        """Publish the rows the quality gates rejected, or ``None``.
+
+        Kept out of ``all`` and the per-ATS slices deliberately: these
+        rows are wrong, not merely low-confidence. Writing them anyway
+        makes the deletions auditable — a rule that starts eating good
+        data shows up as a jump in ``total_jobs_quarantined`` and can be
+        diffed row by row against the reason column.
+        """
+        if not quarantine_csv_paths:
+            return None
+        entry: dict[str, object] = {}
+        with _temp_file(".parquet") as pq_path:
+            pl.concat(
+                [
+                    pl.scan_csv(path, **_SCAN_CSV_KWARGS)
+                    for path in quarantine_csv_paths
+                ],
+                how="diagonal_relaxed",
+            ).sink_parquet(pq_path, compression="zstd")
+            n_rows = pl.scan_parquet(pq_path).select(pl.len()).collect().item()
+            sha, size = _file_sha_size(pq_path)
+            key = f"{self._prefix}/quarantine.parquet"
+            self._r2.upload(
+                pq_path,
+                key,
+                content_type="application/vnd.apache.parquet",
+                cache_control=CACHE_CONTROL_LATEST,
+            )
+        entry["parquet"] = self._public_or_key(key)
+        entry["parquet_sha256"] = sha
+        entry["parquet_size_bytes"] = size
+        entry["rows"] = n_rows
+        logger.info("Quarantined %d rows failing a quality gate", n_rows)
+        return entry
 
     def prune_legacy_paths(self) -> int:
         """Delete every key under the pre-2.0 layout. Idempotent.
@@ -374,6 +458,109 @@ class DatasetPublisher:
 
         return entry, n_rows
 
+    def _stamp_liveness(
+        self, stage_stack: ExitStack, all_pq: Path, observed_at: datetime
+    ) -> Path:
+        """Add ``first_seen_at`` / ``last_seen_at`` to the global snapshot.
+
+        The pipeline is a pure snapshot model: each run republishes
+        whatever the boards currently serve, with no tombstoning, so
+        "has this posting been up for three days or three months?" was
+        not expressible at all. ``posted_at`` doesn't answer it — it is
+        the employer's own claim, is missing on a large share of rows,
+        and never changes when a posting is quietly relisted.
+
+        Every row in this snapshot is live right now, so ``last_seen_at``
+        is the publish timestamp. ``first_seen_at`` carries forward from
+        the previous run through a two-column sidecar; a posting we have
+        never seen starts today. A posting that disappears and returns
+        restarts its clock, which is the honest reading — we cannot tell
+        a relist from a fresh posting without the sweep below.
+
+        This is the cheap half of audit finding 02. It makes staleness
+        *measurable*; it does not detect a posting that 404s while still
+        being served in the board's index. That needs a link-liveness
+        sweep — an out-of-band job that walks ``url`` on a rotation and
+        records a ``dead_at``, sized by the board's rate limits rather
+        than by this publish. Landing these columns first gives that job
+        somewhere to write and gives us the staleness baseline to
+        justify it.
+        """
+        previous = self._load_first_seen()
+        stamped = stage_stack.enter_context(_temp_file(".parquet"))
+        now = pl.lit(observed_at).cast(pl.Datetime(time_unit="us", time_zone="UTC"))
+
+        lf = pl.scan_parquet(all_pq).with_columns(_seen_key_expr())
+        lf = lf.join(previous.lazy(), on=_SEEN_KEY_COLUMN, how="left").with_columns(
+            pl.coalesce(pl.col(FIRST_SEEN_COLUMN), now).alias(FIRST_SEEN_COLUMN),
+            now.alias(LAST_SEEN_COLUMN),
+        )
+        lf.drop(_SEEN_KEY_COLUMN).sink_parquet(stamped, compression="zstd")
+
+        self._save_first_seen(stamped)
+        return stamped
+
+    def _load_first_seen(self) -> pl.DataFrame:
+        """Previous run's first-sighting index, empty when unavailable.
+
+        Never fatal: a missing or unreadable sidecar costs the age of
+        the postings it covered, which self-heals as they are seen
+        again, and is not worth failing a publish over.
+        """
+        empty = pl.DataFrame(
+            schema={
+                _SEEN_KEY_COLUMN: pl.String,
+                FIRST_SEEN_COLUMN: pl.Datetime(time_unit="us", time_zone="UTC"),
+            }
+        )
+        key = f"{self._prefix}/{FIRST_SEEN_SIDECAR}"
+        try:
+            body = self._r2.get_bytes(key)
+        except StorageError:
+            body = None
+        if not body:
+            logger.info("No %s yet; every posting starts its clock today.", key)
+            return empty
+        try:
+            frame = pl.read_parquet(io.BytesIO(body))
+        except Exception:
+            logger.warning(
+                "%s is unreadable; restarting first-seen tracking.", key, exc_info=True
+            )
+            return empty
+        if set(frame.columns) != {_SEEN_KEY_COLUMN, FIRST_SEEN_COLUMN}:
+            logger.warning("%s has an unexpected schema; ignoring it.", key)
+            return empty
+        return frame
+
+    def _save_first_seen(self, stamped: Path) -> None:
+        """Rewrite the sidecar from the snapshot we just built.
+
+        Written from the published rows rather than merged with the old
+        sidecar, so keys for postings that have gone away age out
+        instead of growing without bound.
+        """
+        with _temp_file(".parquet") as sidecar:
+            (
+                pl.scan_parquet(stamped)
+                .with_columns(_seen_key_expr())
+                .select(_SEEN_KEY_COLUMN, FIRST_SEEN_COLUMN)
+                .unique(subset=_SEEN_KEY_COLUMN, keep="first")
+                .sink_parquet(sidecar, compression="zstd")
+            )
+            try:
+                self._r2.upload(
+                    sidecar,
+                    f"{self._prefix}/{FIRST_SEEN_SIDECAR}",
+                    content_type="application/vnd.apache.parquet",
+                    cache_control=CACHE_CONTROL_LATEST,
+                )
+            except StorageError:
+                logger.warning(
+                    "Could not upload %s; ages restart next run.",
+                    FIRST_SEEN_SIDECAR,
+                )
+
     def _stream_write_all_polars(
         self,
         *,
@@ -381,6 +568,8 @@ class DatasetPublisher:
         survivors: dict[str, pl.DataFrame],
         schema_union: list[str],
         rows_total: int,
+        observed_at: datetime,
+        donations: dict[str, pl.DataFrame] | None = None,
     ) -> dict[str, object]:
         """Stream the global ``all.parquet`` from the per-ATS temp CSVs.
 
@@ -389,7 +578,9 @@ class DatasetPublisher:
         1. Per-ATS — ``scan_csv`` + ``semi``-join against its
            survivor index frame, sunk to a per-ATS temp parquet via
            ``sink_parquet``. Polars's semi-join on a small RHS is
-           hash-probe, so the LHS streams.
+           hash-probe, so the LHS streams. Slices with a ``donations``
+           frame also take a ``left``-join to inherit the pay of the
+           gated rows they replaced.
 
         2. Merge parquet — the per-ATS temp parquets are concatenated
            into the global ``all.parquet`` via polars' lazy
@@ -417,13 +608,15 @@ class DatasetPublisher:
                     continue
 
                 pq_temp = stage_stack.enter_context(_temp_file(".parquet"))
-                (
+                lf = (
                     pl.scan_csv(csv_path, **_SCAN_CSV_KWARGS)
                     .with_row_index(name="_local_idx")
                     .join(survivor_frame.lazy(), on="_local_idx", how="semi")
-                    .drop("_local_idx")
-                    .sink_parquet(pq_temp, compression="zstd")
                 )
+                donation = (donations or {}).get(ats.value)
+                if donation is not None and not donation.is_empty():
+                    lf = _apply_salary_donations(lf, donation)
+                lf.drop("_local_idx").sink_parquet(pq_temp, compression="zstd")
                 per_ats_parquets.append(pq_temp)
 
             # Build the merged parquet first — both ``all.parquet`` and
@@ -436,6 +629,8 @@ class DatasetPublisher:
                 pl.DataFrame(
                     schema=dict.fromkeys(schema_union, pl.String)
                 ).write_parquet(all_pq, compression="zstd")
+
+            all_pq = self._stamp_liveness(stage_stack, all_pq, observed_at)
 
             if "parquet" in FORMATS_ALL and self._write_parquet:
                 pq_key = f"{self._prefix}/all.parquet"
@@ -561,6 +756,167 @@ ATS_DEDUP_PRIORITY: dict[str, int] = {
     "usajobs": 6,
 }
 
+# Sources whose postings sit behind a sign-in wall. A reader who isn't
+# logged in can't open the link at all, so when the same posting also
+# exists on the employer's own board we keep the employer's row — the
+# ATS priority above already ranks it higher, but the gated source
+# formats titles and locations differently enough that the exact and
+# country-blocked passes never pair the two (see Pass 6 / Pass 7).
+GATED_LINK_SOURCES: frozenset[str] = frozenset({"welcometothejungle"})
+
+# The priority number that means "the employer's own board". Gated
+# rows are only demoted against these, so a gated posting still beats
+# the public aggregators (seek, eightfold, eures, bundesagentur, …)
+# that sit below it in ``ATS_DEDUP_PRIORITY``.
+DIRECT_EMPLOYER_PRIORITY = 1
+
+# Pay columns carried from a dropped gated row onto the employer row
+# that replaced it. Welcome to the Jungle is one of the few sources
+# that publishes salary, so dropping its rows outright would take the
+# pay figure with them. Currency and period travel with the numbers —
+# a min/max without them is unusable.
+_SALARY_CARRY_COLUMNS: tuple[tuple[str, pl.DataType], ...] = (
+    ("salary_min", pl.Float64()),
+    ("salary_max", pl.Float64()),
+    ("salary_currency", pl.String()),
+    ("salary_period", pl.String()),
+    ("salary_summary", pl.String()),
+)
+_DONOR_PREFIX = "_donor_"
+# Records which source the carried pay came from. Null on every row
+# that kept its own salary, so a consumer can tell the two apart.
+SALARY_SOURCE_COLUMN = "salary_source"
+
+# Pass 7 fuzz-matches the punctuation-free slug rather than the raw
+# title, because punctuation is exactly what the gated source changes:
+# ``"Manager of Account Executives (Startups)"`` against ``"Manager,
+# Account Executives, Startups"`` scores 70 on the raw titles.
+#
+# It also uses ``token_sort_ratio`` rather than Pass 5's
+# ``token_set_ratio``, and a higher bar. ``token_set_ratio`` rewards
+# the tokens two titles share and forgives the ones they don't, which
+# is too loose once a wrong pair also hands over its salary: measured
+# on real Anthropic postings it scored "Senior Staff Software Engineer
+# (Node Infrastructure)" against "Staff Software Engineer, Data
+# Infrastructure" at 93.8, and "Strategic Account Executive (GSI)"
+# against "Manager of Account Executive (Strategic Sales)" at 93.1.
+# Sorted-token matching puts those at 81.7 and 80.0 while the real
+# pairs — plurals, ``Engineering``/``Engineer``, reordered qualifiers —
+# stay at 95.8 and above.
+_GATED_FUZZY_MARGIN = 5
+
+
+def _company_norm_expr(column: str = "company") -> pl.Expr:
+    """Punctuation-free employer key used to block the dedup passes.
+
+    Lowercases inline rather than trusting the caller: the character
+    class is ``[^a-z0-9]``, so on a column that still has capitals it
+    silently eats them — ``"OpenAI"`` becomes ``"pen"`` — and every
+    pass keyed on it would quietly stop matching instead of failing.
+    The keys frame already lowercases ``company``, which makes this a
+    no-op there, but the expression is now correct wherever it's used.
+    """
+    return (
+        pl.col(column)
+        .str.to_lowercase()
+        .str.replace_all(r"[^a-z0-9]", "")
+        .alias("_company_norm")
+    )
+
+
+# Employer values that name no employer. Two families end up here.
+#
+# Localized "withheld" markers: EURES aggregates national job services
+# that hide the employer until a candidate applies through the official
+# portal, so ~86% of FR rows say "non renseigné" and ~60% of ES rows are
+# blank. The scrapers pass these through verbatim on purpose — the
+# locale of the placeholder identifies the source service, and the
+# postings themselves (title, location, description, pay) are real.
+#
+# Bare careers hostnames: Oracle, Phenom and Personio derive the
+# employer from the careers URL when no curated name is configured,
+# which publishes "jobs.bell.ca" as if it were a company.
+#
+# Both are facet poison — they collect thousands of unrelated postings
+# under one meaningless label. These rows are quarantined out of the
+# published dataset: an employer is the one fact every consumer joins
+# on, and a posting that names none is not usable as market data.
+#
+# This is the single largest quarantine rule by volume, and the drop is
+# deliberate rather than incidental — check ``placeholder_employer`` in
+# quarantine.parquet before reading any change in the FR/ES row counts
+# as a scraper regression.
+#
+# Detection lives here rather than in the scrapers so the per-ATS
+# slices still carry the source's own value, where the locale of the
+# placeholder identifies which national service withheld it.
+_PLACEHOLDER_EMPLOYERS = frozenset({
+    "-", "--", ".", "...", "?", "n/a", "na", "n.a.", "none", "null",
+    "not specified", "not disclosed", "not provided", "unspecified",
+    "unknown", "undisclosed", "confidential", "confidentiel",
+    "konfidentiell", "vertraulich", "anonymous", "anonyme", "anonym",
+    "non renseigné", "non renseigne", "non précisé", "non precise",
+    "no se especifica", "no especificado", "sin especificar",
+    "siehe beschreibung", "see description", "see job description",
+    "voir description", "ver descripción", "ver descripcion",
+    "employer", "company", "empresa", "entreprise", "arbeitgeber",
+    "private", "privat", "particulier",
+})
+
+# A value that is nothing but a domain: "jobs.bell.ca", "careers.acme.com".
+# Anchored and TLD-gated so real names keep their dots — "Booz Allen
+# Hamilton Inc." has spaces, and "Yahoo! Inc." has no dotted tail.
+_HOSTNAME_EMPLOYER_RE = r"^(?:www\.)?[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)+$"
+
+
+FIRST_SEEN_COLUMN = "first_seen_at"
+LAST_SEEN_COLUMN = "last_seen_at"
+FIRST_SEEN_SIDECAR = "first_seen.parquet"
+_SEEN_KEY_COLUMN = "_seen_key"
+
+
+def _seen_key_expr() -> pl.Expr:
+    """Identity used to recognize a posting across runs.
+
+    Prefers the source's own id over the URL: boards rewrite URLs when a
+    posting is edited or the employer renames its board, and a changed
+    URL would look like a brand-new posting and reset its age. ``ats_id``
+    is blank on a few sources, which fall back to the URL.
+    """
+    ats_id = pl.col("ats_id").cast(pl.String).fill_null("").str.strip_chars()
+    return (
+        pl.when(ats_id.str.len_bytes() > 0)
+        .then(pl.col("ats_type").cast(pl.String).fill_null("") + pl.lit("|") + ats_id)
+        .otherwise(pl.col("url").cast(pl.String).fill_null(""))
+        .alias(_SEEN_KEY_COLUMN)
+    )
+
+
+def _placeholder_company_expr(column: str = "company") -> pl.Expr:
+    """True where the employer value names no actual employer."""
+    normalized = pl.col(column).cast(pl.String).str.strip_chars().str.to_lowercase()
+    return normalized.is_in(sorted(_PLACEHOLDER_EMPLOYERS)) | normalized.str.contains(
+        _HOSTNAME_EMPLOYER_RE
+    )
+
+
+def _title_slug_expr(column: str = "title") -> pl.Expr:
+    """Punctuation-free title used to pair a gated posting with the
+    employer's own listing of the same job.
+
+    Welcome to the Jungle rewrites the employer's punctuation —
+    ``"Staff Software Engineer, Environments Infrastructure"`` on
+    Greenhouse becomes ``"Staff Software Engineer (Environments
+    Infrastructure)"`` — so every exact pass keyed on the title text
+    misses. Collapsing all non-alphanumerics to single spaces makes
+    the two identical. Expects an already-lowercased column.
+    """
+    return (
+        pl.col(column)
+        .str.replace_all(r"[^a-z0-9]+", " ")
+        .str.strip_chars()
+    )
+
 
 def _key_col_or_empty(schema_names: list[str], name: str) -> pl.Expr:
     """Return ``pl.col(name)`` cast to String + filled, or an empty
@@ -573,6 +929,27 @@ def _key_col_or_empty(schema_names: list[str], name: str) -> pl.Expr:
             .str.strip_chars()
         )
     return pl.lit("", dtype=pl.String)
+
+
+def _donor_salary_exprs(
+    schema_names: list[str], *, carry: bool
+) -> list[pl.Expr]:
+    """Pay columns for the keys frame, one ``_donor_``-prefixed column
+    per entry in :data:`_SALARY_CARRY_COLUMNS`.
+
+    Only slices that can donate (the gated sources) read the real
+    column; everyone else gets a typed null literal. The keys frame
+    spans the whole corpus, so this keeps the added width to a few
+    all-null columns for the ~4M rows that will never donate.
+    """
+    exprs: list[pl.Expr] = []
+    for name, dtype in _SALARY_CARRY_COLUMNS:
+        alias = f"{_DONOR_PREFIX}{name}"
+        if carry and name in schema_names:
+            exprs.append(pl.col(name).cast(dtype, strict=False).alias(alias))
+        else:
+            exprs.append(pl.lit(None, dtype=dtype).alias(alias))
+    return exprs
 
 
 # Country-code map for the locations the EU aggregators (eures /
@@ -760,7 +1137,13 @@ def _country_iso_from_location(loc: object) -> str:
 
     A spelled-out country always wins over a trailing two-letter token,
     so ``"Toronto, ON, Canada"`` is Canada and ``"Remote-Friendly,
-    United States; San Francisco, CA"`` is the US.
+    United States; San Francisco, CA"`` is the US. A trailing token that
+    is simultaneously a country code and a US/Canadian admin code is
+    settled by :func:`_resolve_admin_code` rather than being read as a
+    country outright — see :data:`_AMBIGUOUS_ADMIN_CODES` for why ``CA``
+    and ``DE`` disagree. Anything with no country token at all falls
+    through to :func:`looks_us`, which reads the US phrasings this
+    module's tables don't ("Remote - US").
     """
     if not isinstance(loc, str) or not loc.strip():
         return ""
@@ -778,7 +1161,9 @@ def _country_iso_from_location(loc: object) -> str:
         resolved = _resolve_admin_code(m.group(1).upper(), components)
         if resolved:
             return resolved
-    if any(part.lower() in _US_STATE_NAMES for part in components):
+    if any(part.lower() in _US_STATE_NAMES for part in components) or looks_us(
+        stripped
+    ):
         return "US"
     return ""
 
@@ -814,9 +1199,24 @@ def _title_core(title: object) -> str:
     return _WHITESPACE_RUN_RE.sub(" ", stripped.lower()).strip()
 
 
+@dataclass
+class DedupOutcome:
+    """What the cross-ATS dedup decided.
+
+    ``survivors`` maps ``ats_value`` → a frame of ``_local_idx`` (the
+    source-CSV row indices to keep). ``donations`` maps ``ats_value``
+    → a frame of ``_local_idx`` plus ``_donor_``-prefixed pay columns
+    to graft onto that row, produced when a gated posting was dropped
+    in favour of it.
+    """
+
+    survivors: dict[str, pl.DataFrame]
+    donations: dict[str, pl.DataFrame] = field(default_factory=dict)
+
+
 def _dedup_from_per_ats_csvs(
     per_ats_csv_paths: dict[str, Path],
-) -> tuple[dict[str, pl.DataFrame], int, int]:
+) -> tuple[DedupOutcome, int, int]:
     """Build keys, run cross-ATS dedup, and return per-ATS survivors.
 
     The keys frame is sunk to a temp parquet via ``sink_parquet``
@@ -827,10 +1227,10 @@ def _dedup_from_per_ats_csvs(
     parquet on disk is small (~80 MB / million rows for the nine
     thin string columns we project).
 
-    Returns ``(survivors_by_ats, n_raw, n_kept)``.
+    Returns ``(outcome, n_raw, n_kept)``.
     """
     if not per_ats_csv_paths:
-        return {}, 0, 0
+        return DedupOutcome(survivors={}), 0, 0
 
     key_lfs: list[pl.LazyFrame] = []
     for ats_value, csv_path in per_ats_csv_paths.items():
@@ -861,6 +1261,9 @@ def _dedup_from_per_ats_csvs(
                 .str.to_uppercase()
                 .alias("country_iso"),
                 _key_col_or_empty(schema_names, "ats_id").alias("ats_id"),
+                *_donor_salary_exprs(
+                    schema_names, carry=ats_value in GATED_LINK_SOURCES
+                ),
             ]
         )
         key_lfs.append(klf)
@@ -876,9 +1279,9 @@ def _dedup_from_per_ats_csvs(
         keys = pl.read_parquet(keys_pq)
 
     n_raw = keys.height
-    survivors = _decide_dedup_survivors_polars(keys)
-    n_kept = sum(s.height for s in survivors.values())
-    return survivors, n_raw, n_kept
+    outcome = _decide_dedup_survivors_polars(keys)
+    n_kept = sum(s.height for s in outcome.survivors.values())
+    return outcome, n_raw, n_kept
 
 
 def _decide_dedup_survivors_polars(
@@ -886,8 +1289,8 @@ def _decide_dedup_survivors_polars(
     *,
     fuzzy_threshold: int = 90,
     fuzzy_max_block_size: int = 5000,
-) -> dict[str, pl.DataFrame]:
-    """Run the five-pass cross-ATS dedup.
+) -> DedupOutcome:
+    """Run the seven-pass cross-ATS dedup.
 
     Passes 1-3 are exact-match window-function passes (cheap). Pass 4
     is the normalisation pass that catches aggregator formatting
@@ -896,19 +1299,27 @@ def _decide_dedup_survivors_polars(
     the remaining cross-ATS pairs within ``(company_norm, country_iso)``
     blocks to catch typo / minor-wording dups.
 
-    The fuzzy pass is bounded by ``fuzzy_max_block_size`` (default
+    Passes 6 and 7 handle the gated sources (:data:`GATED_LINK_SOURCES`)
+    that passes 1-5 structurally cannot reach: they block on
+    ``country_iso``, and the employer-side row often has none (a
+    Greenhouse location like ``"San Francisco, CA | New York City,
+    NY"`` extracts nothing) while the gated row has a clean ``US``.
+    Both drop only gated rows, and only against the employer's own
+    board, so no other source's survivorship changes.
+
+    The fuzzy passes are bounded by ``fuzzy_max_block_size`` (default
     5 000 rows per block) so a pathological block — a recruiting agency
     with tens of thousands of postings — doesn't blow up the wall
     clock with n² fuzz calls. Blocks beyond the cap fall through to
     exact-match-only.
 
-    Returns a dict mapping ``ats_value`` → polars frame with one
-    column ``_local_idx`` (the source-CSV row indices to keep). The
-    streaming Pass 3 ``semi``-joins each per-ATS scan against this
-    frame.
+    Returns a :class:`DedupOutcome` whose ``survivors`` maps
+    ``ats_value`` → polars frame with one column ``_local_idx`` (the
+    source-CSV row indices to keep). The streaming Pass 3
+    ``semi``-joins each per-ATS scan against that frame.
     """
     if keys.is_empty():
-        return {}
+        return DedupOutcome(survivors={})
 
     work = keys.sort(["_priority", "_orig_idx"])
 
@@ -950,11 +1361,7 @@ def _decide_dedup_survivors_polars(
     work = work.filter(ctl_keep).drop("_dedup_key")
 
     # ---- Pass 3: cross-ATS (company_norm, ats_id) dedup -------------------
-    work = work.with_columns(
-        pl.col("company")
-        .str.replace_all(r"[^a-z0-9]", "")
-        .alias("_company_norm")
-    )
+    work = work.with_columns(_company_norm_expr())
     work = work.with_columns(
         (pl.col("_company_norm") + pl.lit("|") + pl.col("ats_id")).alias("_cid_key")
     )
@@ -1036,7 +1443,65 @@ def _decide_dedup_survivors_polars(
     if drop_orig_idxs:
         work = work.filter(~pl.col("_orig_idx").is_in(list(drop_orig_idxs)))
 
-    work = work.drop("_company_norm", "_title_core", "_country_iso")
+    # ---- Pass 6: gated-source demotion, exact and location-free ----------
+    # A gated posting loses to the employer's own board whenever the
+    # two agree on company and on a punctuation-free title, with no
+    # location or country agreement required — the gated source
+    # reformats both. Only gated rows are droppable here, which is
+    # what makes a location-free key safe: applied corpus-wide it
+    # would collapse the aggregator blocks where one title legitimately
+    # repeats across hundreds of cities.
+    work = work.with_columns(
+        _title_slug_expr().alias("_title_slug"),
+        pl.col("ats_type").is_in(list(GATED_LINK_SOURCES)).alias("_is_gated"),
+    )
+    work = work.with_columns(
+        (pl.col("_company_norm") + pl.lit("|") + pl.col("_title_slug")).alias(
+            "_gated_key"
+        )
+    )
+    gated_valid = (pl.col("_company_norm").str.len_bytes() > 0) & (
+        pl.col("_title_slug").str.len_bytes() > 0
+    )
+    # ``min`` skips nulls, so this is the lowest ``_orig_idx`` among the
+    # direct-employer rows of the group — the row that survives and
+    # therefore the one that inherits the gated row's pay.
+    work = work.with_columns(
+        pl.when(
+            gated_valid
+            & ~pl.col("_is_gated")
+            & (pl.col("_priority") == DIRECT_EMPLOYER_PRIORITY)
+        )
+        .then(pl.col("_orig_idx"))
+        .otherwise(None)
+        .min()
+        .over("_gated_key")
+        .alias("_direct_anchor")
+    )
+    gated_exact_drop = (
+        gated_valid & pl.col("_is_gated") & pl.col("_direct_anchor").is_not_null()
+    )
+    donation_pairs = work.filter(gated_exact_drop).select(
+        pl.col("_orig_idx").alias("_donor_orig_idx"),
+        pl.col("_direct_anchor").alias("_recipient_orig_idx"),
+    )
+    work = work.filter(~gated_exact_drop).drop("_direct_anchor", "_gated_key")
+
+    # ---- Pass 7: gated-source demotion, fuzzy within company blocks ------
+    gated_fuzzy_drops, fuzzy_pairs = _gated_fuzzy_drops(
+        work,
+        threshold=fuzzy_threshold,
+        max_block_size=fuzzy_max_block_size,
+    )
+    if gated_fuzzy_drops:
+        work = work.filter(~pl.col("_orig_idx").is_in(list(gated_fuzzy_drops)))
+        donation_pairs = pl.concat([donation_pairs, fuzzy_pairs])
+
+    donations = _gated_salary_donations(keys, work, donation_pairs)
+
+    work = work.drop(
+        "_company_norm", "_title_core", "_country_iso", "_title_slug", "_is_gated"
+    )
 
     # Materialize per-ATS survivor frames keyed on _local_idx for Pass 3
     # of the publish run.
@@ -1045,7 +1510,7 @@ def _decide_dedup_survivors_polars(
     for key_tuple, part in parts.items():
         ats_value = key_tuple[0] if isinstance(key_tuple, tuple) else key_tuple
         survivors[str(ats_value)] = part.select("_local_idx")
-    return survivors
+    return DedupOutcome(survivors=survivors, donations=donations)
 
 
 def _phase2_fuzzy_drops(
@@ -1056,7 +1521,7 @@ def _phase2_fuzzy_drops(
 ) -> set[int]:
     """Within each ``(company_norm, country_iso)`` block, greedily drop
     cross-ATS rows whose title fuzz-matches a higher-priority row's
-    title at ``token_set_ratio >= threshold``.
+    title at ``token_sort_ratio >= threshold``.
 
     Greedy, sorted by ``(_priority, _orig_idx)``: each new row is
     compared against every already-kept row from a *different* ATS.
@@ -1115,8 +1580,17 @@ def _phase2_fuzzy_drops(
                 # sink the score below the threshold: "Senior Cloud
                 # Engineer" vs "senior cloud engineer" scores 86, and
                 # "Lead, Enterprise" vs "Lead (Enterprise)" scores 69.
+                #
+                # ``token_sort_ratio`` and not ``token_set_ratio``: the
+                # set variant scores the *intersection* of the two token
+                # sets, so tokens present on only one side barely count.
+                # That is the wrong reading for a job title, where the
+                # extra qualifier is the whole difference — "Senior Staff
+                # Software Engineer (Node Infrastructure)" against "Staff
+                # Software Engineer, Data Infrastructure" scores 94 under
+                # the set variant and 82 once the tokens must line up.
                 if (
-                    fuzz.token_set_ratio(
+                    fuzz.token_sort_ratio(
                         title_raw, kept_title, processor=utils.default_process
                     )
                     >= threshold
@@ -1131,7 +1605,419 @@ def _phase2_fuzzy_drops(
     return drop
 
 
+def _gated_fuzzy_drops(
+    work: pl.DataFrame,
+    *,
+    threshold: int,
+    max_block_size: int,
+) -> tuple[set[int], pl.DataFrame]:
+    """Drop gated rows whose title fuzz-matches an employer row's,
+    blocking on ``company_norm`` alone.
+
+    Pass 5 already does a fuzzy sweep, but it blocks on
+    ``(company_norm, country_iso)`` and the employer-side row often
+    has no extractable country, so the pair never lands in the same
+    block. Dropping the country from the key is only safe because
+    this pass is one-directional: gated rows are the only candidates
+    for removal, and only ``DIRECT_EMPLOYER_PRIORITY`` rows count as
+    anchors.
+
+    Matching runs ``token_sort_ratio`` over ``_title_slug`` at
+    ``threshold + _GATED_FUZZY_MARGIN`` — see that constant for why it
+    is stricter than Pass 5. An abbreviation the employer spells out
+    (``Applied AI`` vs ``Applied Artificial Intelligence``) falls under
+    the bar and keeps both rows, which is the safe way to fail: a
+    wrong pair would delete a posting and misattribute its pay.
+
+    The scan is restricted to companies that actually have a gated
+    row, which is what keeps it cheap — a few thousand companies
+    rather than every employer in the corpus.
+
+    Returns ``(orig_idxs_to_drop, pairs)`` where ``pairs`` maps each
+    dropped row to the anchor that replaced it, so its pay can follow.
+    """
+    from rapidfuzz import fuzz
+
+    cutoff = threshold + _GATED_FUZZY_MARGIN
+    empty_pairs = pl.DataFrame(
+        schema={"_donor_orig_idx": pl.Int64, "_recipient_orig_idx": pl.Int64}
+    )
+    named = pl.col("_company_norm").str.len_bytes() > 0
+    gated_companies = (
+        work.filter(pl.col("_is_gated") & named).select("_company_norm").unique()
+    )
+    if gated_companies.is_empty():
+        return set(), empty_pairs
+
+    scope = work.filter(
+        named
+        & (pl.col("_is_gated") | (pl.col("_priority") == DIRECT_EMPLOYER_PRIORITY))
+    ).join(gated_companies, on="_company_norm", how="semi")
+
+    drop: set[int] = set()
+    pairs: list[tuple[int, int]] = []
+    for _, block in scope.group_by(["_company_norm"], maintain_order=True):
+        gated_rows = block.filter(pl.col("_is_gated"))
+        if gated_rows.is_empty():
+            continue
+        anchor_rows = block.filter(~pl.col("_is_gated")).sort("_orig_idx")
+        if anchor_rows.is_empty():
+            continue
+        if block.height > max_block_size:
+            logger.warning(
+                "Gated-source fuzzy dedup: skipping oversize block "
+                "(%d rows, company=%s).",
+                block.height,
+                block.row(0, named=True)["_company_norm"],
+            )
+            continue
+        anchors = [
+            (row["_title_slug"], int(row["_orig_idx"]))
+            for row in anchor_rows.iter_rows(named=True)
+            if row["_title_slug"]
+        ]
+        if not anchors:
+            continue
+        for row in gated_rows.iter_rows(named=True):
+            title_slug = row["_title_slug"]
+            if not title_slug:
+                continue
+            for anchor_title, anchor_idx in anchors:
+                if fuzz.token_sort_ratio(title_slug, anchor_title) >= cutoff:
+                    drop.add(int(row["_orig_idx"]))
+                    pairs.append((int(row["_orig_idx"]), anchor_idx))
+                    break
+
+    if not pairs:
+        return drop, empty_pairs
+    return drop, pl.DataFrame(pairs, schema=empty_pairs.schema, orient="row")
+
+
+def _gated_salary_donations(
+    keys: pl.DataFrame,
+    survivors: pl.DataFrame,
+    pairs: pl.DataFrame,
+) -> dict[str, pl.DataFrame]:
+    """Route the pay of every dropped gated row to the row that
+    replaced it.
+
+    Welcome to the Jungle is one of the few sources that publishes
+    salary, and the employer boards that outrank it usually publish
+    none, so a plain drop would trade an openable link for a missing
+    number. Recipients come from two places: the pairs recorded by
+    passes 6 and 7, and — for gated rows that passes 1-5 dropped,
+    which record no pair — an exact ``(company_norm, title_slug)``
+    lookup against the survivors.
+
+    Returns ``ats_value`` → frame of ``_local_idx`` plus the
+    ``_donor_``-prefixed pay columns.
+    """
+    donor_columns = [f"{_DONOR_PREFIX}{name}" for name, _ in _SALARY_CARRY_COLUMNS]
+    if any(column not in keys.columns for column in donor_columns):
+        return {}
+
+    priced = pl.col(f"{_DONOR_PREFIX}salary_min").is_not_null() | pl.col(
+        f"{_DONOR_PREFIX}salary_max"
+    ).is_not_null()
+    donors = (
+        keys.filter(pl.col("ats_type").is_in(list(GATED_LINK_SOURCES)) & priced)
+        .join(survivors.select("_orig_idx"), on="_orig_idx", how="anti")
+        .drop("_local_idx")
+    )
+    if donors.is_empty():
+        return {}
+
+    recipients = survivors.filter(
+        ~pl.col("_is_gated") & (pl.col("_priority") == DIRECT_EMPLOYER_PRIORITY)
+    )
+    if recipients.is_empty():
+        return {}
+
+    donors = donors.with_columns(
+        _company_norm_expr(),
+        _title_slug_expr().alias("_title_slug"),
+    )
+    by_orig_idx = recipients.select(
+        pl.col("_orig_idx").alias("_recipient_orig_idx"),
+        pl.col("ats_type").alias("_pair_ats"),
+        pl.col("_local_idx").alias("_pair_local_idx"),
+    )
+    # ``survivors`` is still ordered by ``(_priority, _orig_idx)``, so
+    # the first row of a slug group is the best recipient in it.
+    by_slug = recipients.group_by(
+        ["_company_norm", "_title_slug"], maintain_order=True
+    ).agg(
+        pl.col("ats_type").first().alias("_slug_ats"),
+        pl.col("_local_idx").first().alias("_slug_local_idx"),
+    )
+
+    donors = (
+        donors.join(
+            pairs.unique(subset=["_donor_orig_idx"], keep="first").rename(
+                {"_donor_orig_idx": "_orig_idx"}
+            ),
+            on="_orig_idx",
+            how="left",
+        )
+        .join(by_orig_idx, on="_recipient_orig_idx", how="left")
+        .join(by_slug, on=["_company_norm", "_title_slug"], how="left")
+        .with_columns(
+            pl.coalesce("_pair_ats", "_slug_ats").alias("_recipient_ats"),
+            pl.coalesce("_pair_local_idx", "_slug_local_idx").alias("_local_idx"),
+        )
+        .filter(pl.col("_recipient_ats").is_not_null())
+    )
+    if donors.is_empty():
+        return {}
+
+    # One donation per recipient — a row can only carry one salary, so
+    # the earliest donor wins and the rest are discarded.
+    donors = donors.sort("_orig_idx").unique(
+        subset=["_recipient_ats", "_local_idx"], keep="first", maintain_order=True
+    )
+
+    selected = donors.select(
+        "_recipient_ats",
+        "_local_idx",
+        *donor_columns,
+        pl.col("ats_type").alias(f"{_DONOR_PREFIX}{SALARY_SOURCE_COLUMN}"),
+    )
+    donations: dict[str, pl.DataFrame] = {}
+    for key_tuple, part in selected.partition_by(
+        "_recipient_ats", as_dict=True
+    ).items():
+        ats_value = key_tuple[0] if isinstance(key_tuple, tuple) else key_tuple
+        donations[str(ats_value)] = part.drop("_recipient_ats")
+    return donations
+
+
 # --- helpers ---------------------------------------------------------------
+
+
+def _apply_salary_donations(
+    lf: pl.LazyFrame, donation: pl.DataFrame
+) -> pl.LazyFrame:
+    """Fill a row's pay from the gated posting that was dropped for it.
+
+    Only rows that publish no salary of their own are touched, and all
+    five pay columns move together so a min never ends up beside
+    another posting's currency. :data:`SALARY_SOURCE_COLUMN` records
+    where a filled figure came from and stays null everywhere else.
+
+    The donation frame holds one row per recipient, so the ``left``
+    join keeps the scan streaming and can't duplicate rows.
+    """
+    lf = lf.join(donation.lazy(), on="_local_idx", how="left")
+    schema_names = lf.collect_schema().names()
+
+    def own(name: str, dtype: pl.DataType) -> pl.Expr:
+        if name in schema_names:
+            return pl.col(name).cast(dtype, strict=False)
+        return pl.lit(None, dtype=dtype)
+
+    own_min = own("salary_min", pl.Float64())
+    own_max = own("salary_max", pl.Float64())
+    donor_min = pl.col(f"{_DONOR_PREFIX}salary_min")
+    donor_max = pl.col(f"{_DONOR_PREFIX}salary_max")
+    donated = (
+        own_min.is_null()
+        & own_max.is_null()
+        & (donor_min.is_not_null() | donor_max.is_not_null())
+    )
+
+    filled = [
+        pl.when(donated)
+        .then(pl.col(f"{_DONOR_PREFIX}{name}"))
+        .otherwise(own(name, dtype))
+        .alias(name)
+        for name, dtype in _SALARY_CARRY_COLUMNS
+    ]
+    filled.append(
+        pl.when(donated)
+        .then(pl.col(f"{_DONOR_PREFIX}{SALARY_SOURCE_COLUMN}"))
+        .otherwise(own(SALARY_SOURCE_COLUMN, pl.String()))
+        .alias(SALARY_SOURCE_COLUMN)
+    )
+    return lf.with_columns(filled).drop(
+        [column for column in donation.columns if column.startswith(_DONOR_PREFIX)]
+    )
+
+
+# Column carrying the reason a row was rejected. Present only on the
+# quarantine artifact — the published slices never ship it.
+QUARANTINE_REASON_COLUMN = "quarantine_reason"
+
+# How far past the publish time a ``posted_at`` may sit before the row
+# is treated as corrupt rather than merely fresh. Publisher clocks,
+# source timezones, and same-day scheduling all produce legitimately
+# "future" stamps measured in hours; a genuine publication date is
+# never days ahead. The audit found rows dated 2027 and 2028 leading a
+# "past week" search on a July 2026 snapshot.
+FUTURE_POSTED_AT_GRACE = timedelta(days=2)
+
+
+def _future_posted_at_expr(now: datetime) -> pl.Expr:
+    """True where ``posted_at`` is too far ahead to be a real date.
+
+    ``posted_at`` arrives as text from the per-ATS CSV, so it is parsed
+    here rather than compared directly. An unparseable value yields null
+    and is left alone: this gate is for dates that are readable and
+    wrong, not for malformed ones.
+    """
+    parsed = (
+        pl.col("posted_at")
+        .cast(pl.String)
+        .str.to_datetime(time_unit="us", time_zone="UTC", strict=False)
+    )
+    return parsed.is_not_null() & (parsed > pl.lit(now + FUTURE_POSTED_AT_GRACE))
+
+
+# Largest credible pay at each period, in USD-equivalent units. These
+# are outlier bounds, not market estimates: the point is to reject a
+# figure no posting could carry, such as the $8.6M/year nurse the audit
+# found, without touching a genuine executive package.
+_MAX_CREDIBLE_USD_BY_PERIOD: dict[str, float] = {
+    "HOUR": 2_000.0,
+    "DAY": 10_000.0,
+    "WEEK": 50_000.0,
+    "MONTH": 200_000.0,
+    "YEAR": 5_000_000.0,
+}
+
+# Rough units per USD, used to scale the bounds above. Without this a
+# flat cap would delete real postings wholesale: ¥6,000,000/year is an
+# ordinary Japanese salary, and ₩60,000,000 an ordinary Korean one.
+# Order of magnitude is all that matters for an outlier test, so these
+# do not need to track live exchange rates.
+_UNITS_PER_USD: dict[str, float] = {
+    "JPY": 150.0, "KRW": 1_300.0, "IDR": 15_000.0, "VND": 25_000.0,
+    "INR": 85.0, "HUF": 360.0, "CLP": 950.0, "COP": 4_000.0,
+    "NGN": 1_500.0, "KES": 130.0, "EGP": 50.0, "PHP": 58.0,
+    "THB": 35.0, "TWD": 32.0, "RSD": 108.0, "UAH": 41.0,
+    "ARS": 1_000.0, "MXN": 18.0, "ZAR": 18.0, "TRY": 40.0,
+    "CZK": 23.0, "SEK": 11.0, "NOK": 11.0, "DKK": 7.0,
+    "PLN": 4.0, "RON": 4.6, "BGN": 1.8, "ISK": 138.0,
+    "BRL": 5.5, "PEN": 3.8, "UYU": 40.0, "MAD": 10.0,
+    "CNY": 7.2, "HKD": 7.8, "MYR": 4.7, "ILS": 3.7,
+    "SAR": 3.75, "AED": 3.67,
+}
+
+# Period wording that contradicts a declared ``salary_period``. Matched
+# against ``salary_summary`` — the human-readable string the ATS itself
+# rendered, which is the better witness when the two disagree.
+_SUMMARY_PERIOD_PATTERNS: dict[str, str] = {
+    "HOUR": r"(?i)(?:per\s+hour|hourly|/\s*hr\b|/\s*hour|\ban\s+hour\b)",
+    "DAY": r"(?i)(?:per\s+day|daily|/\s*day|per\s+diem)",
+    "WEEK": r"(?i)(?:per\s+week|weekly|/\s*week)",
+    "MONTH": r"(?i)(?:per\s+month|monthly|/\s*month|\ba\s+month\b)",
+    "YEAR": r"(?i)(?:per\s+year|per\s+annum|annually|annual|yearly|/\s*yr\b|/\s*year)",
+}
+
+
+def _implausible_salary_expr(schema_names: list[str]) -> pl.Expr:
+    """True where the pay is too large to be real for its own period.
+
+    Bounds are scaled by currency so the test means the same thing in
+    every denomination; a row with no period can't be judged and is
+    left alone. Only an upper bound is applied — a floor would delete
+    genuine postings in low-wage economies far sooner than it would
+    catch a bad one.
+    """
+    scale = (
+        pl.col("salary_currency")
+        .cast(pl.String)
+        .str.to_uppercase()
+        .replace_strict(_UNITS_PER_USD, default=1.0, return_dtype=pl.Float64)
+    )
+    ceiling = (
+        pl.col("salary_period")
+        .cast(pl.String)
+        .str.to_uppercase()
+        .replace_strict(
+            _MAX_CREDIBLE_USD_BY_PERIOD, default=None, return_dtype=pl.Float64
+        )
+    ) * scale
+    amounts = [
+        pl.col(column).cast(pl.Float64)
+        for column in ("salary_min", "salary_max")
+        if column in schema_names
+    ]
+    amount = pl.max_horizontal(amounts) if len(amounts) > 1 else amounts[0]
+    return ceiling.is_not_null() & amount.is_not_null() & (amount > ceiling)
+
+
+def _contradicted_period_expr() -> pl.Expr:
+    """True where ``salary_period`` disagrees with ``salary_summary``.
+
+    A row claiming ``YEAR`` while its own summary reads "$65.00 per
+    hour" has one of the two wrong, and the amount is being read on the
+    strength of whichever it is. Rather than pick a winner we drop the
+    row — this is the pairing behind the audit's $8.6M nurse.
+
+    A summary naming both periods ("£50,000 per annum, £25 per hour")
+    is not a contradiction: it agrees with the declared one and merely
+    adds context.
+    """
+    declared = pl.col("salary_period").cast(pl.String).str.to_uppercase()
+    summary = pl.col("salary_summary").cast(pl.String)
+    mentions = {
+        period: summary.str.contains(pattern)
+        for period, pattern in _SUMMARY_PERIOD_PATTERNS.items()
+    }
+    contradiction = pl.lit(value=False)
+    for period in _SUMMARY_PERIOD_PATTERNS:
+        others = pl.any_horizontal(
+            [expr for other, expr in mentions.items() if other != period]
+        )
+        contradiction = contradiction | (
+            (declared == period) & ~mentions[period] & others
+        )
+    return summary.is_not_null() & declared.is_not_null() & contradiction
+
+
+def _quarantine_reason_expr(schema_names: list[str], *, now: datetime) -> pl.Expr | None:
+    """Reason this row must not be published, or null to keep it.
+
+    Returns ``None`` when the slice has no column any check can read, so
+    callers can skip the partition entirely.
+    """
+    checks: list[tuple[pl.Expr, str]] = []
+    if "posted_at" in schema_names:
+        checks.append((_future_posted_at_expr(now), "future_posted_at"))
+    if {"salary_period", "salary_currency"} <= set(schema_names) and (
+        {"salary_min", "salary_max"} & set(schema_names)
+    ):
+        checks.append((_implausible_salary_expr(schema_names), "implausible_salary"))
+    if {"salary_period", "salary_summary"} <= set(schema_names):
+        checks.append((_contradicted_period_expr(), "contradicted_salary_period"))
+    if "company" in schema_names:
+        checks.append((_placeholder_company_expr(), "placeholder_employer"))
+    if not checks:
+        return None
+    expr = pl.lit(None, dtype=pl.String)
+    for condition, reason in reversed(checks):
+        expr = pl.when(condition).then(pl.lit(reason, dtype=pl.String)).otherwise(expr)
+    return expr
+
+
+def _partition_quarantine(
+    lf: pl.LazyFrame, schema_names: list[str], *, now: datetime
+) -> tuple[pl.LazyFrame, pl.LazyFrame | None]:
+    """Split a slice into rows to publish and rows to quarantine.
+
+    Rejected rows are dropped from the dataset outright rather than
+    flagged, but they are written to a sidecar so a bad rule shows up as
+    a spike in the quarantine count instead of silently deleting data.
+    """
+    reason = _quarantine_reason_expr(schema_names, now=now)
+    if reason is None:
+        return lf, None
+    tagged = lf.with_columns(reason.alias(QUARANTINE_REASON_COLUMN))
+    kept = tagged.filter(pl.col(QUARANTINE_REASON_COLUMN).is_null()).drop(
+        QUARANTINE_REASON_COLUMN
+    )
+    rejected = tagged.filter(pl.col(QUARANTINE_REASON_COLUMN).is_not_null())
+    return kept, rejected
 
 
 def _enrich_lazy(lf: pl.LazyFrame) -> pl.LazyFrame:
@@ -1159,6 +2045,22 @@ def _enrich_lazy(lf: pl.LazyFrame) -> pl.LazyFrame:
     if "title" in schema_names and "is_remote" not in schema_names:
         lf = lf.with_columns(_is_remote_expr().alias("is_remote"))
 
+    if "title" in schema_names:
+        if "seniority" not in schema_names:
+            lf = lf.with_columns(_seniority_expr().alias("seniority"))
+        else:
+            # An ATS that ships its own level is more authoritative than
+            # the title, so only fill the gaps it leaves.
+            current = pl.col("seniority").cast(pl.String)
+            lf = lf.with_columns(
+                pl.when(
+                    current.is_null() | (current.str.strip_chars().str.len_bytes() == 0)
+                )
+                .then(_seniority_expr())
+                .otherwise(current)
+                .alias("seniority")
+            )
+
     if "salary_summary" in schema_names and "salary_min" not in schema_names:
         salary_struct = pl.Struct({"min": pl.Float64, "max": pl.Float64})
         lf = (
@@ -1173,6 +2075,9 @@ def _enrich_lazy(lf: pl.LazyFrame) -> pl.LazyFrame:
             )
             .drop("_salary_parsed")
         )
+
+    if "description" in schema_names:
+        lf = _backfill_salary_from_description(lf, schema_names)
 
     if "location" in schema_names:
         derived_country = pl.col("location").map_elements(
@@ -1205,6 +2110,80 @@ def _enrich_lazy(lf: pl.LazyFrame) -> pl.LazyFrame:
     return lf
 
 
+# Cheap pre-filter for the description salary parse. Running the full
+# parser over every description would mean a Python callback across ~4M
+# bodies of up to 25k chars; this vectorized test skips the ~95% that
+# mention no money at all, leaving the callback to the plausible rows.
+_PAY_HINT_PATTERN = (
+    r"(?i)(?:salary|compensation|pay range|pay scale|hiring range|"
+    r"hourly rate|base pay|target earnings)"
+)
+
+_SALARY_BLOCK_STRUCT = pl.Struct({
+    "min": pl.Float64,
+    "max": pl.Float64,
+    "currency": pl.String,
+    "period": pl.String,
+})
+
+
+def _safe_parse_salary_block(text: object) -> dict[str, object | None]:
+    block = parse_salary_block(text)
+    if block is None:
+        return {"min": None, "max": None, "currency": None, "period": None}
+    return {
+        "min": block.min_amount,
+        "max": block.max_amount,
+        "currency": block.currency,
+        "period": block.period,
+    }
+
+
+def _backfill_salary_from_description(
+    lf: pl.LazyFrame, schema_names: list[str]
+) -> pl.LazyFrame:
+    """Fill missing pay columns from the disclosed range in the body.
+
+    Most ATSes expose no structured salary field, which is why only
+    2.31% of the published corpus showed any compensation — while
+    pay-transparency law had already put the number in the description
+    of a large share of those same postings. Existing values are never
+    overwritten: a range the ATS stated outright always beats one
+    recovered from prose.
+    """
+    existing = [c for c in ("salary_min", "salary_max") if c in schema_names]
+    needs_pay = pl.lit(True)
+    for column in existing:
+        needs_pay = needs_pay & pl.col(column).cast(pl.Float64).is_null()
+
+    candidate = (
+        pl.when(needs_pay & pl.col("description").str.contains(_PAY_HINT_PATTERN))
+        .then(pl.col("description"))
+        .otherwise(pl.lit(None, dtype=pl.String))
+    )
+    lf = lf.with_columns(
+        candidate.map_elements(
+            _safe_parse_salary_block,
+            return_dtype=_SALARY_BLOCK_STRUCT,
+            skip_nulls=True,
+        ).alias("_pay_block")
+    )
+    for column, struct_field, dtype in (
+        ("salary_min", "min", pl.Float64),
+        ("salary_max", "max", pl.Float64),
+        ("salary_currency", "currency", pl.String),
+        ("salary_period", "period", pl.String),
+    ):
+        derived = pl.col("_pay_block").struct.field(struct_field).cast(dtype)
+        if column in schema_names:
+            lf = lf.with_columns(
+                pl.coalesce(pl.col(column).cast(dtype), derived).alias(column)
+            )
+        else:
+            lf = lf.with_columns(derived.alias(column))
+    return lf.drop("_pay_block")
+
+
 def _is_remote_expr() -> pl.Expr:
     """Vectorized polars version of :func:`infer_is_remote`.
 
@@ -1233,6 +2212,31 @@ def _is_remote_expr() -> pl.Expr:
     # Narrow heuristic — never returns False; absence of a remote
     # marker in the title is not evidence the role is on-site.
     return pl.when(remote_match).then(pl.lit(True)).otherwise(None)
+
+
+def _seniority_expr() -> pl.Expr:
+    """Vectorized polars version of :func:`infer_seniority`.
+
+    Builds one ``when``/``then`` branch per rule in precedence order, so
+    the rules stay declared once in
+    :mod:`ats_scrapers.enrichment.derived` and this only compiles them.
+    Staying native matters here: a Python callback over ~4M titles would
+    drop the whole slice off the streaming engine.
+
+    Falls back to the callback when a stripped ``derived.py`` ships
+    without the rules, matching :func:`_is_remote_expr`.
+    """
+    if not _SENIORITY_RULES:
+        return pl.col("title").map_elements(infer_seniority, return_dtype=pl.String)
+
+    title = pl.col("title").cast(pl.String, strict=False)
+    chain = pl.when(pl.lit(False)).then(pl.lit(None, dtype=pl.String))
+    for rule in _SENIORITY_RULES:
+        matched = title.str.contains(rule.pattern)
+        if rule.exclude:
+            matched = matched & ~title.str.contains(rule.exclude)
+        chain = chain.when(matched).then(pl.lit(rule.level, dtype=pl.String))
+    return chain.otherwise(pl.lit(None, dtype=pl.String))
 
 
 def _safe_parse_salary(value: object) -> dict[str, float | None]:
@@ -1403,6 +2407,21 @@ def _merge_parquets_streaming(input_paths: list[Path], out_path: Path) -> None:
     pl.concat(lfs, how="diagonal_relaxed").sink_parquet(
         out_path, compression="zstd"
     )
+
+
+def _csv_has_rows(path: Path) -> bool:
+    """Whether a sunk CSV holds anything beyond its header.
+
+    ``sink_csv`` always writes the header, so an empty quarantine slice
+    is a non-zero file. Checking here keeps header-only temp files out
+    of the concat, which would otherwise widen the schema for nothing.
+    """
+    try:
+        return (
+            pl.scan_csv(path, **_SCAN_CSV_KWARGS).select(pl.len()).collect().item() > 0
+        )
+    except pl.exceptions.NoDataError:
+        return False
 
 
 def _file_sha_size(path: Path) -> tuple[str, int]:

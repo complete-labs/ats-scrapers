@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import re
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Literal, Self
 
@@ -176,10 +176,16 @@ class Job(BaseModel):
        by the downstream LLM enrichment pass / a geocoding service.
 
     3. **Compensation** (``salary_currency``, ``salary_period``,
-       ``salary_summary``, ``salary_min``, ``salary_max``).
+       ``salary_summary``, ``salary_min``, ``salary_max``,
+       ``offers_equity``, ``offers_bonus``, ``offers_commission``).
        ``salary_min`` / ``salary_max`` are *derived* from
        ``salary_summary`` via ``ats_scrapers.enrichment.parse_salary_range``
-       when the ATS exposes only free text.
+       when the ATS exposes only free text, or lifted out of the
+       description body by ``parse_salary_block`` for the many ATSes
+       that publish no structured salary at all. The ``offers_*`` flags
+       cover the rest of the package: base salary alone understates a
+       sales or early-stage role, and the ATSes that disclose those
+       components disclose only their existence, never an amount.
 
     4. **Classification** (``experience``, ``employment_type``,
        ``department``, ``team``, ``requisition_id``, ``apply_url``,
@@ -381,8 +387,49 @@ class Job(BaseModel):
             "Same population logic as ``salary_min``."
         ),
     )
+    offers_equity: bool | None = Field(
+        default=None,
+        description=(
+            "Whether the package includes equity, when the ATS says so "
+            "outright (Ashby publishes an ``EquityPercentage`` / "
+            "``EquityCashValue`` component). Boolean rather than an "
+            "amount because the amount is never disclosed — every such "
+            "component we have seen carries null values and the summary "
+            "'Offers Equity'. Like ``is_remote`` this only ever asserts "
+            "``True``: a posting that doesn't mention equity is not "
+            "thereby known to exclude it."
+        ),
+    )
+    offers_bonus: bool | None = Field(
+        default=None,
+        description=(
+            "Whether the package includes a bonus, on the same terms as "
+            "``offers_equity``."
+        ),
+    )
+    offers_commission: bool | None = Field(
+        default=None,
+        description=(
+            "Whether the package includes commission, on the same terms "
+            "as ``offers_equity``. Common on sales postings, where base "
+            "salary alone understates total compensation."
+        ),
+    )
 
     # --- Classification ---------------------------------------------------
+
+    seniority: str | None = Field(
+        default=None,
+        description=(
+            "Rank named by the title, one of ``SENIORITY_LEVELS`` "
+            "(INTERN, JUNIOR, MID, SENIOR, STAFF, PRINCIPAL, LEAD, "
+            "MANAGER, DIRECTOR, EXECUTIVE). Derived at publish time by "
+            "``infer_seniority`` unless the ATS supplies one. ``None`` "
+            "when the title names no rank — most employers omit the "
+            "qualifier at their baseline level, and which level that is "
+            "differs by employer, so it is not inferable from the title."
+        ),
+    )
 
     experience: int | None = Field(
         default=None,
@@ -501,6 +548,24 @@ class Job(BaseModel):
             "dict in parquet."
         ),
     )
+
+    @model_validator(mode="after")
+    def _assume_utc_for_naive_timestamps(self) -> Self:
+        """Attach UTC to any naive ``posted_at`` / ``fetched_at``.
+
+        The schema documents both as UTC, but a scraper reaching for
+        ``datetime.fromtimestamp(ts)`` without a timezone gets the
+        *scrape host's* local time, so the same epoch produced a
+        different date depending on where the pipeline ran. Naive values
+        are therefore read as the UTC they claim to be, which keeps
+        comparisons against ``fetched_at`` — and any freshness window
+        built on them — meaningful.
+        """
+        for field in ("posted_at", "fetched_at"):
+            value = getattr(self, field)
+            if value is not None and value.tzinfo is None:
+                object.__setattr__(self, field, value.replace(tzinfo=UTC))
+        return self
 
     @model_validator(mode="after")
     def _populate_global_id(self) -> Self:

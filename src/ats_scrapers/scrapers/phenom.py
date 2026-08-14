@@ -97,12 +97,14 @@ class PhenomScraper(BaseScraper):
         country: str = "us",
         include_descriptions: bool = True,
         proxy: str | None = None,
+        company_name: str | None = None,
     ) -> None:
         super().__init__(
             company_slug,
             timeout=timeout,
             include_descriptions=include_descriptions,
             proxy=proxy,
+            company_name=company_name,
         )
         if not company_slug.startswith(("http://", "https://")):
             raise ScraperError(
@@ -112,8 +114,10 @@ class PhenomScraper(BaseScraper):
         self.base_url = company_slug.rstrip("/")
         self.locale = locale
         self.country = country
+        # Falling back to the careers hostname publishes `jobs.bell.ca`
+        # as the employer, so only use it when nothing curated was given.
         host = urlparse(self.base_url).hostname or company_slug
-        self.company_name = host
+        self.company_name = self.company_name or host
 
     async def afetch(self) -> list[Job]:
         async with self.make_fetcher() as fetch:
