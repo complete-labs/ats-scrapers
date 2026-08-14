@@ -58,7 +58,7 @@ from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import polars as pl
 
@@ -727,6 +727,11 @@ class DatasetPublisher:
 
 # When the same (company, title, location) shows up under multiple ATSes,
 # we keep the row from the highest-priority ATS (lowest number wins).
+#
+# Every source the pipeline publishes is listed. An unlisted one falls to
+# ``_DEFAULT_DEDUP_PRIORITY``, which ties it with the public job boards —
+# survivable, but the winner within a tie is decided by scan order rather
+# than by anything meaningful, so a new source belongs in a tier here.
 ATS_DEDUP_PRIORITY: dict[str, int] = {
     # Direct employer ATSes
     "adp": 1, "ashby": 1, "avature": 1, "bamboohr": 1, "beisen": 1,
@@ -743,6 +748,12 @@ ATS_DEDUP_PRIORITY: dict[str, int] = {
     # Big-tech bespoke careers — also priority 1 (single-tenant, canonical)
     "amazon": 1, "apple": 1, "bytedance": 1, "google": 1, "meta": 1,
     "tesla": 1, "tiktok": 1, "uber": 1,
+    # Public job boards that mirror employer postings. They rank below
+    # the employer's own board but above the gated and sourcing tiers,
+    # because their links open for a reader who isn't signed in.
+    "builtin": 2, "getonbrd": 2, "jobsch": 2, "manfred": 2,
+    "programathor": 2, "remoteok": 2, "thehub": 2, "wanted": 2,
+    "wellfound": 2, "weworkremotely": 2, "ycombinator": 2,
     # Hybrid jobboards
     "welcometothejungle": 3, "mercor": 3, "gem": 3,
     "seek": 4,
@@ -752,9 +763,14 @@ ATS_DEDUP_PRIORITY: dict[str, int] = {
     # same role often appears here AND on the employer's direct ATS.
     "bundesagentur": 6,
     "arbetsformedlingen": 6,
+    "eures": 6,
     "jobbankca": 6,
     "usajobs": 6,
 }
+
+# Where an unlisted source lands: the public-job-board tier, matching
+# what the old bare ``.get(ats, 2)`` did for every source missing above.
+_DEFAULT_DEDUP_PRIORITY = 2
 
 # Sources whose postings sit behind a sign-in wall. A reader who isn't
 # logged in can't open the link at all, so when the same posting also
@@ -1168,6 +1184,45 @@ def _country_iso_from_location(loc: object) -> str:
     return ""
 
 
+def _reconciled_country_expr(location: pl.Expr, stored: pl.Expr) -> pl.Expr:
+    """A trustworthy ``country_iso``, reconciling the stored value with
+    what the location text says.
+
+    The stored value normally wins: a scraper reading a structured
+    address field knows more than any heuristic over display text. The
+    exception is the codes in :data:`_AMBIGUOUS_ADMIN_CODES`, which are
+    simultaneously a country and a US or Canadian subdivision. A source
+    that maps a trailing token straight to a country — as this module
+    itself once did — files every ``"San Francisco, CA"`` under Canada,
+    and the wrong code is worse than none: it is what splits a posting
+    and its mirror into different dedup blocks so both survive. When the
+    stored code is one of those four and the resolver reads the location
+    differently, the resolver wins.
+
+    The Python resolver only runs where the stored value cannot be
+    trusted, so the common case stays vectorized.
+    """
+    normalized = stored.cast(pl.String).fill_null("").str.strip_chars().str.to_uppercase()
+    blank = normalized.str.len_bytes() == 0
+    ambiguous = normalized.is_in(sorted(_AMBIGUOUS_ADMIN_CODES))
+    derived = (
+        pl.when(blank | ambiguous)
+        .then(location.cast(pl.String))
+        .otherwise(pl.lit(None, dtype=pl.String))
+        .map_elements(
+            _country_iso_from_location, return_dtype=pl.String, skip_nulls=True
+        )
+        .fill_null("")
+    )
+    return (
+        pl.when(blank)
+        .then(derived)
+        .when(ambiguous & (derived.str.len_bytes() > 0))
+        .then(derived)
+        .otherwise(normalized)
+    )
+
+
 # Trailing parenthesised occupational classification that eures
 # appends to titles like ``"Anlagenmechaniker (m/w/d) ab 20€/Std.
 # (Anlagenmechaniker/in)"``. Bundesagentur ships the same job without
@@ -1244,7 +1299,8 @@ def _dedup_from_per_ats_csvs(
                 pl.col("_local_idx").cast(pl.Int64),
                 pl.lit(ats_value, dtype=pl.String).alias("ats_type"),
                 pl.lit(
-                    ATS_DEDUP_PRIORITY.get(ats_value, 2), dtype=pl.Int32
+                    ATS_DEDUP_PRIORITY.get(ats_value, _DEFAULT_DEDUP_PRIORITY),
+                    dtype=pl.Int32,
                 ).alias("_priority"),
                 _key_col_or_empty(schema_names, "url").alias("url"),
                 _key_col_or_empty(schema_names, "title").alias("title_raw"),
@@ -1384,28 +1440,26 @@ def _decide_dedup_survivors_polars(
 
     # ---- Pass 4 (Phase 1): cross-ATS (company_norm, title_core, country) -
     # ``title_core`` strips the trailing parenthesised Berufenet tag
-    # that eures appends but Bundesagentur doesn't. ``country_iso`` is
-    # prefers the scraper's structured value and falls back to extracting
-    # free-form ``location`` text (eures encodes it as the leading
-    # ``DE``/``FR``/… token, Bundesagentur as a full ``", Deutschland"``
-    # suffix). The combination catches formatting-only cross-source dups
-    # that Pass 2 misses entirely.
-    structured_country = (
+    # that eures appends but Bundesagentur doesn't. ``country_iso`` goes
+    # through :func:`_reconciled_country_expr`, which prefers the
+    # scraper's structured value but overrules it on the codes that also
+    # name a US or Canadian subdivision, and otherwise extracts the
+    # country from free-form ``location`` text (eures encodes it as the
+    # leading ``DE``/``FR``/… token, Bundesagentur as a full
+    # ``", Deutschland"`` suffix). The combination catches
+    # formatting-only cross-source dups that Pass 2 misses entirely.
+    stored_country = (
         pl.col("country_iso")
         if "country_iso" in work.columns
         else pl.lit("", dtype=pl.String)
-    ).str.strip_chars()
-    derived_country = pl.col("location").map_elements(
-        _country_iso_from_location, return_dtype=pl.String
     )
     work = work.with_columns(
         pl.col("title_raw")
         .map_elements(_title_core, return_dtype=pl.String)
         .alias("_title_core"),
-        pl.when(structured_country.str.len_bytes() > 0)
-        .then(structured_country)
-        .otherwise(derived_country)
-        .alias("_country_iso"),
+        _reconciled_country_expr(pl.col("location"), stored_country).alias(
+            "_country_iso"
+        ),
     )
     work = work.with_columns(
         (
@@ -1433,6 +1487,50 @@ def _decide_dedup_survivors_polars(
         pl.col("_orig_idx") == pl.col("_orig_idx").first().over("_p1_key")
     )
     work = work.filter(p1_keep).drop("_p1_key")
+
+    # ---- Pass 4b: cross-ATS (company_norm, title_core), country-free -----
+    # Pass 4 needs the two rows to agree on a country, and a third of the
+    # corpus has no country to agree with: Ashby publishes a bare
+    # ``"San Francisco"`` and no heuristic turns that into ``US``, while
+    # the mirror on another board writes ``"San Francisco, CA, US"``. The
+    # pair therefore lands in two different Pass 4 keys and two different
+    # Pass 5 blocks, and both rows ship — even when the company matches
+    # exactly and the titles are byte-identical.
+    #
+    # Dropping the country from the key is only safe with the conflict
+    # guard: a group collapses when it carries at most one *distinct*
+    # non-empty country, so a title that legitimately repeats across
+    # countries (one company advertising "Software Engineer" in both
+    # London and New York on two boards) is left alone here and handled
+    # by Pass 4, which still separates it per country. Blank countries
+    # are not a conflict — being unknown is the case this pass exists to
+    # serve — so they are dropped before counting.
+    work = work.with_columns(
+        (pl.col("_company_norm") + pl.lit("|") + pl.col("_title_core")).alias("_ct_key")
+    )
+    ct_valid = (pl.col("_company_norm").str.len_bytes() > 0) & (
+        pl.col("_title_core").str.len_bytes() > 0
+    )
+    n_ats_in_valid_ct = (
+        pl.when(ct_valid)
+        .then(pl.col("ats_type"))
+        .otherwise(None)
+        .n_unique()
+        .over("_ct_key")
+    )
+    n_countries_in_ct = (
+        pl.when(ct_valid & (pl.col("_country_iso").str.len_bytes() > 0))
+        .then(pl.col("_country_iso"))
+        .otherwise(None)
+        .drop_nulls()
+        .n_unique()
+        .over("_ct_key")
+    )
+    is_cross_ct = ct_valid & (n_ats_in_valid_ct > 1) & (n_countries_in_ct <= 1)
+    ct_keep = ~is_cross_ct | (
+        pl.col("_orig_idx") == pl.col("_orig_idx").first().over("_ct_key")
+    )
+    work = work.filter(ct_keep).drop("_ct_key")
 
     # ---- Pass 5 (Phase 2): fuzzy within (company_norm, country) blocks ---
     drop_orig_idxs = _phase2_fuzzy_drops(
@@ -1519,90 +1617,130 @@ def _phase2_fuzzy_drops(
     threshold: int,
     max_block_size: int,
 ) -> set[int]:
-    """Within each ``(company_norm, country_iso)`` block, greedily drop
-    cross-ATS rows whose title fuzz-matches a higher-priority row's
-    title at ``token_sort_ratio >= threshold``.
+    """Within each ``company_norm`` block, greedily drop cross-ATS rows
+    whose title fuzz-matches a higher-priority row's title at
+    ``token_sort_ratio >= threshold``.
 
     Greedy, sorted by ``(_priority, _orig_idx)``: each new row is
     compared against every already-kept row from a *different* ATS.
     Same-ATS rows pass through (we never dedup within an ATS — that's
     the publisher's per-ATS-slice contract).
 
-    Skips blocks where either side of the block key is empty (we have
-    no signal for those), where every row shares one ATS (no
-    cross-source dup possible), and where the block has more rows
-    than ``max_block_size`` (avoids n² fuzz on pathological recruiting
-    agencies with tens of thousands of postings).
+    Two rows are only comparable when their countries do not conflict:
+    equal, or unknown on at least one side. Blocking on the company
+    alone and testing the country per pair is what lets a row with no
+    resolvable country reach its mirror — a third of the corpus has
+    none, and keying the block on country exempted all of it from this
+    pass. A company whose block exceeds ``max_block_size`` falls back to
+    per-country sub-blocks rather than being skipped outright, so the
+    recruiting agencies with tens of thousands of postings keep the
+    dedup they had while staying clear of an n² sweep.
+
+    Skips blocks with an empty company (no signal), blocks where every
+    row shares one ATS (no cross-source dup possible), and sub-blocks
+    that are still oversize after the fallback.
 
     Returns the set of ``_orig_idx`` to drop.
     """
     from rapidfuzz import fuzz, utils
 
     drop: set[int] = set()
-    block_groups = work.filter(
-        (pl.col("_company_norm").str.len_bytes() > 0)
-        & (pl.col("_country_iso").str.len_bytes() > 0)
-    ).group_by(["_company_norm", "_country_iso"], maintain_order=True)
+    company_groups = work.filter(
+        pl.col("_company_norm").str.len_bytes() > 0
+    ).group_by(["_company_norm"], maintain_order=True)
 
-    for _, block in block_groups:
-        if block.height < 2:
+    for _, company_block in company_groups:
+        if company_block.height < 2:
             continue
-        if block["ats_type"].n_unique() < 2:
+        if company_block["ats_type"].n_unique() < 2:
             continue
-        if block.height > max_block_size:
+        if company_block.height > max_block_size:
             logger.warning(
-                "Phase-2 fuzzy dedup: skipping oversize block "
-                "(%d rows, company=%s country=%s).",
-                block.height,
-                block.row(0, named=True)["_company_norm"],
-                block.row(0, named=True)["_country_iso"],
+                "Phase-2 fuzzy dedup: company block oversize (%d rows, "
+                "company=%s); falling back to per-country blocks.",
+                company_block.height,
+                company_block.row(0, named=True)["_company_norm"],
             )
-            continue
-        block = block.sort(["_priority", "_orig_idx"])
+            blocks = [
+                part
+                for part in company_block.partition_by("_country_iso")
+                if part.height >= 2 and part["ats_type"].n_unique() >= 2
+            ]
+        else:
+            blocks = [company_block]
 
-        # Greedy scan. ``kept`` is a list of (title_raw, ats_type)
-        # tuples seen so far; for each new row we check fuzz against
-        # every kept row from a DIFFERENT ATS.
-        kept: list[tuple[str, str]] = []
-        for row in block.iter_rows(named=True):
-            title_raw = row["title_raw"]
-            ats = row["ats_type"]
-            orig_idx = row["_orig_idx"]
-            if not title_raw:
+        for block in blocks:
+            if block.height > max_block_size:
+                logger.warning(
+                    "Phase-2 fuzzy dedup: skipping oversize block "
+                    "(%d rows, company=%s country=%s).",
+                    block.height,
+                    block.row(0, named=True)["_company_norm"],
+                    block.row(0, named=True)["_country_iso"],
+                )
                 continue
-            matched = False
-            for kept_title, kept_ats in kept:
-                if kept_ats == ats:
-                    continue
-                # ``default_process`` lowercases and drops punctuation
-                # before tokenising. Without it the comparison is done on
-                # raw display strings, where cosmetic differences alone
-                # sink the score below the threshold: "Senior Cloud
-                # Engineer" vs "senior cloud engineer" scores 86, and
-                # "Lead, Enterprise" vs "Lead (Enterprise)" scores 69.
-                #
-                # ``token_sort_ratio`` and not ``token_set_ratio``: the
-                # set variant scores the *intersection* of the two token
-                # sets, so tokens present on only one side barely count.
-                # That is the wrong reading for a job title, where the
-                # extra qualifier is the whole difference — "Senior Staff
-                # Software Engineer (Node Infrastructure)" against "Staff
-                # Software Engineer, Data Infrastructure" scores 94 under
-                # the set variant and 82 once the tokens must line up.
-                if (
-                    fuzz.token_sort_ratio(
-                        title_raw, kept_title, processor=utils.default_process
-                    )
-                    >= threshold
-                ):
-                    matched = True
-                    break
-            if matched:
-                drop.add(int(orig_idx))
-            else:
-                kept.append((title_raw, ats))
+            _phase2_scan_block(
+                block.sort(["_priority", "_orig_idx"]),
+                drop=drop,
+                threshold=threshold,
+                fuzz=fuzz,
+                processor=utils.default_process,
+            )
 
     return drop
+
+
+def _phase2_scan_block(
+    block: pl.DataFrame,
+    *,
+    drop: set[int],
+    threshold: int,
+    fuzz: Any,
+    processor: Any,
+) -> None:
+    """Greedy cross-ATS title sweep over one pre-sorted block."""
+    # ``kept`` is a list of (title_raw, ats_type, country) tuples seen so
+    # far; for each new row we check fuzz against every kept row from a
+    # DIFFERENT ATS whose country does not contradict it.
+    kept: list[tuple[str, str, str]] = []
+    for row in block.iter_rows(named=True):
+        title_raw = row["title_raw"]
+        ats = row["ats_type"]
+        country = row["_country_iso"]
+        orig_idx = row["_orig_idx"]
+        if not title_raw:
+            continue
+        matched = False
+        for kept_title, kept_ats, kept_country in kept:
+            if kept_ats == ats:
+                continue
+            if country and kept_country and country != kept_country:
+                continue
+            # ``default_process`` lowercases and drops punctuation before
+            # tokenising. Without it the comparison is done on raw display
+            # strings, where cosmetic differences alone sink the score
+            # below the threshold: "Senior Cloud Engineer" vs "senior
+            # cloud engineer" scores 86, and "Lead, Enterprise" vs
+            # "Lead (Enterprise)" scores 69.
+            #
+            # ``token_sort_ratio`` and not ``token_set_ratio``: the set
+            # variant scores the *intersection* of the two token sets, so
+            # tokens present on only one side barely count. That is the
+            # wrong reading for a job title, where the extra qualifier is
+            # the whole difference — "Senior Staff Software Engineer (Node
+            # Infrastructure)" against "Staff Software Engineer, Data
+            # Infrastructure" scores 94 under the set variant and 82 once
+            # the tokens must line up.
+            if (
+                fuzz.token_sort_ratio(title_raw, kept_title, processor=processor)
+                >= threshold
+            ):
+                matched = True
+                break
+        if matched:
+            drop.add(int(orig_idx))
+        else:
+            kept.append((title_raw, ats, country))
 
 
 def _gated_fuzzy_drops(
@@ -2080,31 +2218,24 @@ def _enrich_lazy(lf: pl.LazyFrame) -> pl.LazyFrame:
         lf = _backfill_salary_from_description(lf, schema_names)
 
     if "location" in schema_names:
-        derived_country = pl.col("location").map_elements(
-            _country_iso_from_location, return_dtype=pl.String
-        )
         if "country_iso" not in schema_names:
-            lf = lf.with_columns(derived_country.alias("country_iso"))
-        else:
-            current_country = pl.col("country_iso").cast(pl.String)
-            blank_country = current_country.is_null() | (
-                current_country.str.strip_chars().str.len_bytes() == 0
-            )
-            missing_location = (
-                pl.when(blank_country)
-                .then(pl.col("location"))
-                .otherwise(pl.lit(None, dtype=pl.String))
-            )
-            derived_missing = missing_location.map_elements(
-                _country_iso_from_location,
-                return_dtype=pl.String,
-                skip_nulls=True,
-            )
             lf = lf.with_columns(
-                pl.when(blank_country)
-                .then(derived_missing)
-                .otherwise(current_country)
+                pl.col("location")
+                .map_elements(_country_iso_from_location, return_dtype=pl.String)
                 .alias("country_iso")
+            )
+        else:
+            # Blank values get filled, and a stored code that names a US
+            # or Canadian subdivision as well as a country gets checked
+            # against the location text — see
+            # :func:`_reconciled_country_expr`. Publishing the reconciled
+            # value (rather than only using it for dedup keys) is what
+            # stops a consumer filtering on ``country_iso = 'US'`` from
+            # losing every California posting a source filed under ``CA``.
+            lf = lf.with_columns(
+                _reconciled_country_expr(
+                    pl.col("location"), pl.col("country_iso")
+                ).alias("country_iso")
             )
 
     return lf
