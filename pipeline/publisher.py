@@ -934,6 +934,24 @@ def _title_slug_expr(column: str = "title") -> pl.Expr:
     )
 
 
+def _winning_ats_expr(valid: pl.Expr, key: str) -> pl.Expr:
+    """The ``ats_type`` that wins a dedup group.
+
+    The frame is sorted by ``(_priority, _orig_idx)``, so the first
+    valid row of a group is its winner and its source is the one whose
+    rows survive the group. Rows failing ``valid`` are excluded, since a
+    row that can't take part in the pass must not decide its outcome.
+    """
+    return (
+        pl.when(valid)
+        .then(pl.col("ats_type"))
+        .otherwise(None)
+        .drop_nulls()
+        .first()
+        .over(key)
+    )
+
+
 def _key_col_or_empty(schema_names: list[str], name: str) -> pl.Expr:
     """Return ``pl.col(name)`` cast to String + filled, or an empty
     string literal if the column doesn't exist on this slice."""
@@ -1483,9 +1501,14 @@ def _decide_dedup_survivors_polars(
         .over("_p1_key")
     )
     is_cross_p1 = p1_valid & (n_ats_in_valid_p1 > 1)
-    p1_keep = ~is_cross_p1 | (
-        pl.col("_orig_idx") == pl.col("_orig_idx").first().over("_p1_key")
-    )
+    # Keep every row of the winning ATS, not just the single best row.
+    # ``title_core`` is coarse enough that one company's two offices in
+    # one country share a key — an Ashby "Strategic Account Executive"
+    # in San Francisco and another in San Diego — and those are two
+    # postings, not a duplicate. Dropping only the *other* sources'
+    # rows is what this pass is for, and it keeps the module's rule
+    # that we never dedup within an ATS true of the exact passes too.
+    p1_keep = ~is_cross_p1 | (pl.col("ats_type") == _winning_ats_expr(p1_valid, "_p1_key"))
     work = work.filter(p1_keep).drop("_p1_key")
 
     # ---- Pass 4b: cross-ATS (company_norm, title_core), country-free -----
@@ -1528,7 +1551,7 @@ def _decide_dedup_survivors_polars(
     )
     is_cross_ct = ct_valid & (n_ats_in_valid_ct > 1) & (n_countries_in_ct <= 1)
     ct_keep = ~is_cross_ct | (
-        pl.col("_orig_idx") == pl.col("_orig_idx").first().over("_ct_key")
+        pl.col("ats_type") == _winning_ats_expr(ct_valid, "_ct_key")
     )
     work = work.filter(ct_keep).drop("_ct_key")
 

@@ -123,6 +123,40 @@ to the employer row that replaced it when that row prices nothing
 itself; `salary_source` names where the figure came from. Rows that
 published their own salary keep it and leave the column null.
 
+### Fixed — duplicate postings the dedup could not see
+
+A posting and its mirror on a second board both shipped whenever
+neither could be placed in the same block, which is what put duplicate
+Anthropic and Metriport rows in `all.{csv,parquet}`.
+
+- Rows with no resolvable country are no longer invisible to the two
+  strongest passes. Both keyed on the country and 1.6M rows (33% of the
+  corpus) have none — Ashby publishes a bare `"San Francisco"` where the
+  aggregator publishes `"San Francisco, CA, US"`. A new pass keys on
+  company plus a normalised title with no country component, collapsing
+  a group only when it carries at most one distinct country, and the
+  fuzzy pass now blocks on the company and tests countries per pair,
+  treating unknown as compatible rather than skipping the row.
+- `country_iso` is reconciled against the location text instead of
+  trusted outright. 51,776 rows were stored as `CA` (Canada) on a
+  location reading `", CA"` (California), which split a posting from its
+  mirror; the repaired value is published, so filtering on
+  `country_iso = 'US'` stops losing California.
+- The exact passes no longer delete one of an employer's own postings.
+  A company with two offices in one country shares a normalised title
+  key, and the pass kept only the single best row in a group — so a
+  mirror arriving on a second board took a real listing with it. Rows
+  from the winning source are all kept; only the other sources' are
+  dropped.
+- All 64 sources have an explicit dedup priority. Twelve were silently
+  defaulting, including `eures`, which belongs beside `bundesagentur`.
+- Titles are compared with `token_sort_ratio` rather than
+  `token_set_ratio`. The set variant scores only the token
+  intersection, so a differing qualifier barely counted and distinct
+  roles ("Senior Staff Software Engineer (Node Infrastructure)" against
+  "Staff Software Engineer, Data Infrastructure") scored above the
+  threshold.
+
 ## [0.2.0] — 2026-07-23
 
 ### Added — company discovery without ATS knowledge

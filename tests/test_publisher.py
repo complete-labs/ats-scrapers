@@ -1610,6 +1610,171 @@ def test_greenhouse_wins_over_welcometothejungle_mirror():
         )
 
 
+def _mirror_keys(rows):
+    """Build a keys frame from ``(ats, priority, title, location,
+    country_iso)`` tuples, in the shape the dedup expects.
+
+    ``_local_idx`` counts within an ATS (it indexes that source's CSV)
+    while ``_orig_idx`` counts across the whole frame, as the real key
+    projection produces.
+    """
+    from collections import defaultdict
+    from itertools import count
+
+    import polars as pl
+
+    local = defaultdict(count)
+    return pl.DataFrame([
+        {
+            "_local_idx": next(local[ats]),
+            "_orig_idx": idx,
+            "_priority": priority,
+            "ats_type": ats,
+            "url": f"https://{ats}.example/{idx}",
+            "title_raw": title,
+            "title": title.lower(),
+            "company": "acme",
+            "location": location.lower(),
+            "country_iso": country,
+            "ats_id": str(idx),
+        }
+        for idx, (ats, priority, title, location, country) in enumerate(rows)
+    ])
+
+
+def test_ashby_wins_over_ycombinator_mirror_with_no_country():
+    """The employer's board publishes a bare city and the aggregator
+    publishes the full address, so neither Pass 4 nor Pass 5 could pair
+    them — Pass 4 needs the countries to be equal and Pass 5 skipped
+    every row without one. A third of the corpus has no resolvable
+    country, and this is what it cost: 16 duplicated Metriport postings.
+    """
+    from pipeline.publisher import _decide_dedup_survivors_polars
+
+    keys = _mirror_keys([
+        ("ashby", 1, "Senior Full Stack Engineer", "San Francisco", ""),
+        ("ycombinator", 2, "Senior Full Stack Engineer", "San Francisco, CA, US", "US"),
+    ])
+    survivors = _decide_dedup_survivors_polars(keys).survivors
+    assert sorted(survivors) == ["ashby"]
+
+
+def test_a_stored_california_country_still_pairs_with_its_us_mirror():
+    """``CA`` is Canada as an ISO code and California as a postal one,
+    and 51,776 rows are stored with the country reading Canada off a
+    California address. The stored value used to win outright, filing
+    the employer row under ``CA`` and its mirror under ``US`` — two
+    blocks, two surviving rows.
+
+    Two *different* countries is also the one thing the country-free
+    pass refuses to collapse, so nothing downstream rescues this pair:
+    the stored value has to be repaired for them to meet at all.
+    """
+    from pipeline.publisher import _decide_dedup_survivors_polars
+
+    keys = _mirror_keys([
+        ("greenhouse", 1, "Research Engineer", "San Francisco, CA", "CA"),
+        ("ycombinator", 2, "Research Engineer", "San Francisco, CA, US", "US"),
+    ])
+    survivors = _decide_dedup_survivors_polars(keys).survivors
+    assert sorted(survivors) == ["greenhouse"]
+
+
+def test_the_same_title_in_two_countries_keeps_both_rows():
+    """The guard on the country-free pass. One company advertising one
+    title in two countries is two postings, and a key with no country
+    component would collapse them into one — so a group is only
+    collapsed when it carries at most one distinct country.
+    """
+    from pipeline.publisher import _decide_dedup_survivors_polars
+
+    keys = _mirror_keys([
+        ("greenhouse", 1, "Software Engineer", "New York, NY", "US"),
+        ("lever", 1, "Software Engineer", "London, United Kingdom", "GB"),
+    ])
+    survivors = _decide_dedup_survivors_polars(keys).survivors
+    assert sorted(survivors) == ["greenhouse", "lever"]
+
+
+def test_an_unknown_country_is_not_a_conflict():
+    """Sibling of the test above: two rows in genuinely different
+    countries stay apart, but a row whose country is merely *unknown*
+    must not be read as a third country and block the collapse. The
+    Metriport pair is exactly one known country plus one blank.
+    """
+    from pipeline.publisher import _decide_dedup_survivors_polars
+
+    # Every location string differs, so Pass 2 cannot pair any of them.
+    keys = _mirror_keys([
+        ("greenhouse", 1, "Data Scientist", "Berlin", ""),
+        ("welcometothejungle", 3, "Data Scientist", "Berlin, Germany", "DE"),
+        ("remoteok", 2, "Data Scientist", "Berlin, Deutschland", ""),
+    ])
+    survivors = _decide_dedup_survivors_polars(keys).survivors
+    assert sorted(survivors) == ["greenhouse"]
+
+
+def test_two_offices_on_one_ats_are_not_collapsed_into_each_other():
+    """``title_core`` is coarse enough that one company's two offices in
+    one country share a key. Those are two postings, and the exact
+    passes used to keep only the single best row in a group — so a
+    mirror on a second board arriving alongside them silently deleted
+    one of the employer's own listings. Only the other sources' rows
+    are droppable.
+    """
+    from pipeline.publisher import _decide_dedup_survivors_polars
+
+    keys = _mirror_keys([
+        ("ashby", 1, "Strategic Account Executive", "San Francisco, CA", "US"),
+        ("ashby", 1, "Strategic Account Executive", "San Diego, CA", "US"),
+        ("welcometothejungle", 3, "Strategic Account Executive", "United States", "US"),
+    ])
+    outcome = _decide_dedup_survivors_polars(keys)
+    assert sorted(outcome.survivors) == ["ashby"]
+    assert sorted(outcome.survivors["ashby"]["_local_idx"].to_list()) == [0, 1]
+
+
+def test_country_iso_resolves_a_multi_office_us_location():
+    """A posting open in several US offices names no country, and the
+    per-office form is what Greenhouse publishes. Reading ``US`` off it
+    is what puts the row in the same block as its mirror.
+    """
+    from pipeline.publisher import _country_iso_from_location as f
+
+    assert f("San Francisco, CA | New York City, NY | Seattle, WA") == "US"
+    assert f("Remote-Friendly, United States; San Francisco, CA") == "US"
+    assert f("New York, NY, USA") == "US"
+
+
+def test_a_wrong_stored_country_is_repaired_on_the_published_column():
+    """The reconciliation is not only a dedup-key concern. A consumer
+    filtering ``country_iso = 'US'`` would lose every California posting
+    a source filed under ``CA``, so the published column is repaired
+    too — while a country that is merely *unambiguous* is left alone.
+    """
+    import polars as pl
+
+    from pipeline.publisher import _reconciled_country_expr
+
+    frame = pl.DataFrame({
+        "location": [
+            "San Francisco, CA",
+            "Toronto, ON, CA",
+            "Wilmington, DE",
+            "Berlin, DE",
+            "Indianapolis, IN",
+            "Mumbai, IN",
+            "Dublin, IE",
+            "San Francisco",
+        ],
+        "country_iso": ["CA", "CA", "DE", "DE", "IN", "IN", "IE", ""],
+    })
+    resolved = frame.with_columns(
+        _reconciled_country_expr(pl.col("location"), pl.col("country_iso")).alias("out")
+    )["out"].to_list()
+    assert resolved == ["US", "CA", "US", "DE", "US", "IN", "IE", ""]
+
+
 def test_distinct_roles_at_one_company_are_not_merged():
     """Guard against the fuzzy pass over-collapsing now that titles are
     normalised before comparison."""
