@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ats-scrapers"
-version = "0.2.0"
+version = "0.3.0"
 description = "4.2M+ live jobs from 63,000+ companies. An open dataset and Python toolkit for ATS and job-source data."
 readme = "README.md"
 license = { text = "MIT" }

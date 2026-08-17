@@ -21,7 +21,10 @@ jobs:
       - name: Install uv
         run: pip install uv
       - name: Install package
-        run: uv pip install --system -e ".[dev]" -r pipeline/requirements.txt
+        # `enrich/requirements.txt` is here because tests/enrich imports the
+        # sidecar at module scope: enrich.deterministic pulls in lingua, so
+        # leaving it out fails collection rather than skipping those tests.
+        run: uv pip install --system -e ".[dev]" -r pipeline/requirements.txt -r enrich/requirements.txt
       - name: Lint
         run: ruff check .
       - name: Type check

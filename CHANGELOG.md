@@ -3,7 +3,7 @@
 All notable changes to **ats-scrapers** are documented here. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] — 2026-08-17
 
 ### Fixed — Ashby accuracy
 
